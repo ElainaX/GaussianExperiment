@@ -1,0 +1,1 @@
+python create_ply.py ~/autodl-tmp/output/models/room/point_cloud/iteration_30000
