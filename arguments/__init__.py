@@ -144,6 +144,15 @@ class OptimizationParams(ParamGroup):
         self.depth_lambda_init = 0.01
         self.depth_lambda_final = 0.001
 
+        # ── Connectivity Solidification（默认全部关闭）──────────────────────
+        self.solidification_start = 20000
+        self.lambda_conn_max = 0.0
+        self.lambda_opaque_max = 0.0
+        self.lambda_area = 0.0
+        self.area_min = 1e-6
+        self.tau_edge = 0.1
+        self.k_edge = 5
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

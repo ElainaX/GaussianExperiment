@@ -806,6 +806,11 @@ class TriangleModel:
 
 
 
+    def compute_area_loss(self, a_min: float = 1e-6) -> torch.Tensor:
+        """面积下限保护：防止实体化阶段三角形退化为线或点。"""
+        areas = self.triangle_areas()   # [P]，已实现，可微
+        return torch.relu(a_min - areas).pow(2).sum()
+
     def update_min_weight(self, new_min_weight: float, preserve_outputs: bool = True):
         new_m = float(max(0.0, min(new_min_weight, 1.0 - 1e-4)))
 

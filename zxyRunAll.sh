@@ -5,6 +5,12 @@ python train.py \
 --quiet \
 --eval \
 --indoor \
+--solidification_start 20000 \
+--lambda_conn_max 0.01 \
+--lambda_opaque_max 0.005 \
+--lambda_area 1e-4 \
+--tau_edge 0.1 \
+--k_edge 5
 --test_iterations 30000
 
 

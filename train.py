@@ -54,6 +54,11 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 from utils.render_utils import generate_path, create_videos
+from utils.connectivity_utils import (
+    build_edge_candidates,
+    connectivity_loss,
+    opacity_solidification_loss,
+)
 
 
 
@@ -118,6 +123,16 @@ def training(
     need_delaunay = False
 
     run_restricted_delaunay = opt.densify_until_iter + 1000
+
+    # ── Connectivity Solidification 超参 ─────────────────────────────────
+    solidification_start = opt.solidification_start
+    lambda_conn_max      = opt.lambda_conn_max
+    lambda_opaque_max    = opt.lambda_opaque_max
+    lambda_area          = opt.lambda_area
+    tau_edge             = opt.tau_edge
+    k_edge               = opt.k_edge
+    edge_candidates      = None   # 首次 prune 后构建
+    # ─────────────────────────────────────────────────────────────────────
 
     depth_l1_weight = get_expon_lr_func(opt.depth_lambda_init, opt.depth_lambda_final, max_steps=opt.iterations)
 
@@ -265,6 +280,38 @@ def training(
             normal_loss_super = lambda_normals_super * (normal_error).mean()
             loss += normal_loss_super
 
+        # ── Connectivity Solidification losses ───────────────────────────
+        r_t = min(1.0, max(0.0,
+            (iteration - solidification_start) /
+            max(1, opt.iterations - solidification_start)
+        ))
+
+        if iteration > solidification_start and lambda_conn_max > 0 \
+                and edge_candidates is not None:
+            L_conn = connectivity_loss(
+                triangles.vertices,
+                triangles._triangle_indices,
+                edge_candidates,
+                triangles.importance_score,
+                triangles.vertex_weight,
+                tau=tau_edge,
+            )
+            loss = loss + lambda_conn_max * r_t * L_conn
+
+        if iteration > solidification_start and lambda_opaque_max > 0:
+            L_opaque = opacity_solidification_loss(
+                triangles.vertex_weight,
+                triangles._triangle_indices,
+                triangles.importance_score,
+                importance_threshold=prune_triangles,
+            )
+            loss = loss + lambda_opaque_max * r_t * L_opaque
+
+        if lambda_area > 0:
+            L_area = triangles.compute_area_loss(a_min=opt.area_min)
+            loss = loss + lambda_area * L_area
+        # ─────────────────────────────────────────────────────────────────
+
         loss.backward()
         iter_end.record()
 
@@ -307,7 +354,16 @@ def training(
 
                 if iteration > opt.start_pruning:
                     triangles.prune_triangles(keep_mask)
-             
+
+                # ── 重建边候选图（仅当 connectivity loss 启用时）────────
+                if lambda_conn_max > 0:
+                    edge_candidates = build_edge_candidates(
+                        triangles.vertices,
+                        triangles._triangle_indices,
+                        k=k_edge,
+                    )
+                # ──────────────────────────────────────────────────────────
+
                 # We prune vertices that are no longer used
                 device = triangles.vertices.device
                 used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 

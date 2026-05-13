@@ -165,6 +165,8 @@
 	 // Initialize radius and touched tiles to 0. If this isn't changed,
 	 // this Triangle will not be processed further.
 
+
+	 // 先算这个三角形对应的重心坐标，然后算一个最小的权重值weight作为透明度的参考
 	 const int cumsum_for_triangle = 3 * idx;
 	
 	 radii[idx] = 0;
@@ -195,7 +197,7 @@
 	 center_triangle.y /= 3;
 	 center_triangle.z /= 3;
 
-
+	 // 三角形三个顶点p0，p1，p2
 	 int vertex_index = triangles_indices[cumsum_for_triangle];
 	 float3 p0 = make_float3(
 		vertices[3 * vertex_index + 0],
@@ -222,18 +224,21 @@
 		 return;
 	 }
 
+	 // 算两条边
 	 // Calculate the normal of the Triangle
 	 float3 normal_cvx = {0.0f, 0.0f, 0.0f};
 	 float3 v1 = make_float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
 	 float3 v2 = make_float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
 
+	 // 算法线
 	 float3 cross_prod = make_float3(
 		v1.y * v2.z - v1.z * v2.y,
 		v1.z * v2.x - v1.x * v2.z,
 		v1.x * v2.y - v1.y * v2.x
 	 );
+	 // 变换到view视角，这里要确保不会发生各向异性的scale
 	 cross_prod = transformVec4x3(cross_prod, viewmatrix);
-
+	 // 对cross_prod归一化
 	 float length_cross = __fsqrt_rn(cross_prod.x*cross_prod.x + cross_prod.y*cross_prod.y + cross_prod.z*cross_prod.z);
 	 length_cross = max(length_cross, 1e-4f);
 	 cross_prod.x /= length_cross;
@@ -241,6 +246,7 @@
 	 cross_prod.z /= length_cross;
 	
 	 normal_cvx = cross_prod;
+	 // 这里算的是viewDir_inViewspace
 	 // 2. Normalize the camera viewpoint direction
 	float length_viewpoint = __fsqrt_rn(p_view_triangle.x * p_view_triangle.x + 
 		p_view_triangle.y * p_view_triangle.y + 
@@ -252,6 +258,7 @@
 	normalized_camera_center.y = p_view_triangle.y / length_viewpoint;
 	normalized_camera_center.z = p_view_triangle.z / length_viewpoint;
 
+	// 计算viewdir与normal的夹角cos值，确保其法线朝向相机，否则就翻转
 	// 3. Compute cosine (before flipping the normal)
 	float cos_theta = normal_cvx.x * normalized_camera_center.x +
 	normal_cvx.y * normalized_camera_center.y +
@@ -299,6 +306,7 @@
 		}
 	}
 
+	// 计算2d三角形的内心（内切圆圆心）
 	// Get the three projected 2D points
 	float2 A1 = p_image[cumsum_for_triangle + 0];
 	float2 B1 = p_image[cumsum_for_triangle + 1];
@@ -322,7 +330,7 @@
 
 	 float size = 0.0f;
  
- 
+	// 算一下2d三角形每条边的半平面方程（朝三角形内部为负）
 	 for (int i = 0; i < 3; i++) {
 		// Points forming the segment
 		float2 p1_conv = p_image[cumsum_for_triangle + i];
