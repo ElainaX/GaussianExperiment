@@ -25,5 +25,7 @@ python train.py \
 --skip_delaunay
 
 
-python render.py  -m ~/autodl-tmp/output/models/train02/room
-python metrics.py -m ~/autodl-tmp/output/models/train02/room
+
+python render.py  -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room
+python metrics.py -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room
+python create_ply.py ~/autodl-tmp/output/models/exp_0.1.0/train02/room/point_cloud/iteration_30000
