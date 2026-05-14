@@ -120,7 +120,7 @@ class OptimizationParams(ParamGroup):
 
         self.start_opacity_floor = 5000
 
-        self.start_pruning = 500
+        self.start_pruning = 4000
         self.sigma_until = 30000
         self.final_opacity_iter = 24000
 
@@ -145,7 +145,7 @@ class OptimizationParams(ParamGroup):
         self.depth_lambda_final = 0.001
 
         # ── Connectivity Solidification（默认全部关闭）──────────────────────
-        self.solidification_start = 1000
+        self.solidification_start = 20000
         self.lambda_conn_max = 0.0
         self.lambda_opaque_max = 0.0
         self.lambda_area = 0.0
