@@ -61,6 +61,17 @@ from utils.connectivity_utils import (
 )
 
 
+def log_cuda_memory(iteration: int, log_path: str) -> None:
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved  = torch.cuda.memory_reserved()  / 1024**3
+    peak      = torch.cuda.max_memory_allocated() / 1024**3
+    line = (f"iter {iteration:>6d} | "
+            f"allocated {allocated:.3f} GiB | "
+            f"reserved {reserved:.3f} GiB | "
+            f"peak {peak:.3f} GiB\n")
+    with open(log_path, "a") as f:
+        f.write(line)
+
 
 def training(
         dataset,   
@@ -75,6 +86,9 @@ def training(
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+
+    os.makedirs("experiments", exist_ok=True)
+    cuda_log_path = os.path.join("experiments", "v0.1.0_cuda_memory.txt")
 
     # Load parameters, triangles and scene
     triangles = TriangleModel(dataset.sh_degree)
@@ -425,6 +439,10 @@ def training(
             if iteration < opt.iterations:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none = True)
+                if iteration % 100 == 0:
+                    log_cuda_memory(iteration, cuda_log_path)
+                if iteration % 500 == 0:
+                    torch.cuda.empty_cache()
 
     # cleaning of triangles that we do not need
     viewpoint_stack = scene.getTrainCameras().copy()

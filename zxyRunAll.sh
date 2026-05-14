@@ -1,4 +1,4 @@
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py \
 -s ~/autodl-tmp/data/mipnerf360/room  \
 -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room \

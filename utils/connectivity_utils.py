@@ -59,9 +59,10 @@ def connectivity_loss(
     importance_score: torch.Tensor,
     vertex_weight: torch.Tensor,
     tau: float = 0.1,
+    chunk_size: int = 50000,
 ) -> torch.Tensor:
     """
-    边级软连通 loss：
+    边级软连通 loss（分块计算，避免 [3P,k,3] 张量 OOM）：
 
         L_conn = mean_e [ omega_e * sum_f P_ef * D_edge(e, f) ]
 
@@ -92,19 +93,26 @@ def connectivity_loss(
     omega_per_edge = omega[tri_owner]                                          # [3P]
 
     cands = edge_candidates.to(dev)   # [3P, k]
-    ne_a = edge_a[cands]              # [3P, k, 3]
-    ne_b = edge_b[cands]              # [3P, k, 3]
+    n_edges = 3 * P
+    total = torch.tensor(0.0, device=dev)
 
-    ea = edge_a.unsqueeze(1)
-    eb = edge_b.unsqueeze(1)
+    for start in range(0, n_edges, chunk_size):
+        end = min(start + chunk_size, n_edges)
 
-    d1 = (ea - ne_a).pow(2).sum(-1) + (eb - ne_b).pow(2).sum(-1)   # [3P, k]
-    d2 = (ea - ne_b).pow(2).sum(-1) + (eb - ne_a).pow(2).sum(-1)   # [3P, k]
-    D = torch.minimum(d1, d2)                                        # [3P, k]
+        ea = edge_a[start:end].unsqueeze(1)   # [C, 1, 3]
+        eb = edge_b[start:end].unsqueeze(1)   # [C, 1, 3]
+        ne_a = edge_a[cands[start:end]]       # [C, k, 3]
+        ne_b = edge_b[cands[start:end]]       # [C, k, 3]
+        w    = omega_per_edge[start:end]      # [C]
 
-    P_ef = torch.softmax(-D.detach() / tau, dim=-1)  # stop-grad on weights
+        d1 = (ea - ne_a).pow(2).sum(-1) + (eb - ne_b).pow(2).sum(-1)   # [C, k]
+        d2 = (ea - ne_b).pow(2).sum(-1) + (eb - ne_a).pow(2).sum(-1)   # [C, k]
+        D  = torch.minimum(d1, d2)                                       # [C, k]
 
-    return (omega_per_edge * (P_ef * D).sum(-1)).mean()
+        P_ef = torch.softmax(-D.detach() / tau, dim=-1)
+        total = total + (w * (P_ef * D).sum(-1)).sum()
+
+    return total / n_edges
 
 
 def opacity_solidification_loss(
