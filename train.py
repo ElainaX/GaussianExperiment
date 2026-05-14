@@ -333,7 +333,11 @@ def training(
             loss = loss + lambda_area * L_area
         # ─────────────────────────────────────────────────────────────────
 
-        loss.backward()
+        _loss_finite = torch.isfinite(loss)
+        if _loss_finite:
+            loss.backward()
+        else:
+            print(f"[iter {iteration}] WARNING: non-finite loss, skipping backward.")
         iter_end.record()
 
         
@@ -420,7 +424,7 @@ def training(
                     current_opacity = min(current_opacity, final_opacity)
                     triangles.update_min_weight(current_opacity)
 
-                    prune_triangles += 0.01 
+                    prune_triangles = min(prune_triangles + 0.01, 0.5)
                     mask_out = triangles.vertices.shape[0]
                     triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
             elif iteration == run_restricted_delaunay:
@@ -435,13 +439,19 @@ def training(
                     current_opacity = min(current_opacity, final_opacity)
                     triangles.update_min_weight(current_opacity)
 
-                    prune_triangles += 0.01 
+                    prune_triangles = min(prune_triangles + 0.01, 0.5)
                     mask_out = triangles.vertices.shape[0]
                     triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
             
 
             if iteration < opt.iterations:
-                triangles.optimizer.step()
+                if _loss_finite:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for g in triangles.optimizer.param_groups
+                           for p in g['params'] if p.grad is not None],
+                        max_norm=1.0,
+                    )
+                    triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none = True)
                 if iteration % 100 == 0:
                     log_cuda_memory(iteration, cuda_log_path)

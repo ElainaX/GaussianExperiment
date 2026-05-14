@@ -25,6 +25,9 @@ def build_edge_candidates(
     T = triangle_indices.long().cpu().numpy()
     P = T.shape[0]
 
+    if not np.isfinite(V).all():
+        return torch.zeros((3 * P, k), dtype=torch.long)
+
     v0, v1, v2 = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]
     edge_a = np.concatenate([v0, v1, v2], axis=0)   # [3P, 3]
     edge_b = np.concatenate([v1, v2, v0], axis=0)   # [3P, 3]

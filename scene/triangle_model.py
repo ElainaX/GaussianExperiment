@@ -830,8 +830,8 @@ class TriangleModel:
         AB  = tri[:, 1] - tri[:, 0]                                    # [T, 3]
         AC  = tri[:, 2] - tri[:, 0]                                    # [T, 3]
         cross_prod = torch.cross(AB, AC, dim=1)                        # [T, 3]
-        areas = 0.5 * torch.linalg.norm(cross_prod, dim=1)             # [T]
-        areas = torch.nan_to_num(areas, nan=0.0, posinf=0.0, neginf=0.0)
+        # Use sqrt(sum_sq + eps) instead of linalg.norm to avoid nan gradient at zero
+        areas = 0.5 * (cross_prod.pow(2).sum(dim=1) + 1e-12).sqrt()
         return areas
 
 

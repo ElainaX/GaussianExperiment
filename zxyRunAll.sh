@@ -1,7 +1,7 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py \
 -s ~/autodl-tmp/data/mipnerf360/room  \
--m ~/autodl-tmp/output/models/exp_0.1.0/train02/room \
+-m ~/autodl-tmp/output/models/exp_0.1.0/train03/room \
 --quiet \
 --eval \
 --solidification_start 20000 \
@@ -26,6 +26,6 @@ python train.py \
 
 
 
-python render.py  -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room
-python metrics.py -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room
-python create_ply.py ~/autodl-tmp/output/models/exp_0.1.0/train02/room/point_cloud/iteration_30000
+python render.py  -m ~/autodl-tmp/output/models/exp_0.1.0/train03/room
+python metrics.py -m ~/autodl-tmp/output/models/exp_0.1.0/train03/room
+python create_ply.py ~/autodl-tmp/output/models/exp_0.1.0/train03/room/point_cloud/iteration_30000
