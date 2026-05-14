@@ -152,6 +152,10 @@ def training(
 
     for iteration in range(first_iter, opt.iterations + 1):
 
+        cache_interval = 100 if iteration >= start_upsampling else 500
+        if iteration % cache_interval == 0:
+            torch.cuda.empty_cache()
+
         if need_delaunay:
             with torch.no_grad():
                 triangles.run_restricted_delaunay()
@@ -441,8 +445,6 @@ def training(
                 triangles.optimizer.zero_grad(set_to_none = True)
                 if iteration % 100 == 0:
                     log_cuda_memory(iteration, cuda_log_path)
-                if iteration % 500 == 0:
-                    torch.cuda.empty_cache()
 
     # cleaning of triangles that we do not need
     viewpoint_stack = scene.getTrainCameras().copy()
