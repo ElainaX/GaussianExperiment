@@ -42,11 +42,12 @@ def render_set(model_path, name, iteration, views, triangles, pipeline, backgrou
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        torch.cuda.empty_cache()
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, scaling : int = 1):
     with torch.no_grad():
         triangles = TriangleModel(dataset.sh_degree)
-        triangles.scaling = 4
+        triangles.scaling = scaling
         scene = Scene(args=dataset,
                   triangles=triangles,
                   init_opacity=None,
@@ -72,10 +73,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--scaling", default=1, type=int)
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.scaling)
