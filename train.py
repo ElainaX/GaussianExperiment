@@ -122,7 +122,7 @@ def training(
     
     need_delaunay = False
 
-    run_restricted_delaunay = opt.densify_until_iter + 1000
+    run_restricted_delaunay = opt.iterations + 1 if opt.skip_delaunay else opt.densify_until_iter + 1000
 
     # ── Connectivity Solidification 超参 ─────────────────────────────────
     solidification_start = opt.solidification_start
@@ -142,6 +142,9 @@ def training(
             with torch.no_grad():
                 triangles.run_restricted_delaunay()
             need_delaunay = False
+            if lambda_conn_max > 0:
+                edge_candidates = build_edge_candidates(
+                    triangles.vertices, triangles._triangle_indices, k=k_edge)
 
         # Supersampling
         if iteration == start_upsampling:
@@ -481,7 +484,6 @@ def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn,
 
     # Report test and samples of training set
     if iteration % 1000 == 0:
-        torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 

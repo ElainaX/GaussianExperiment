@@ -125,6 +125,7 @@ class OptimizationParams(ParamGroup):
         self.final_opacity_iter = 5000
 
         self.sigma_start = 0
+        self.skip_delaunay = False
 
         self.splitt_large_triangles = 100
         self.start_upsampling = 4000
