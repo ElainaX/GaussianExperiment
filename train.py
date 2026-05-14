@@ -355,15 +355,6 @@ def training(
                 if iteration > opt.start_pruning:
                     triangles.prune_triangles(keep_mask)
 
-                # ── 重建边候选图（仅当 connectivity loss 启用时）────────
-                if lambda_conn_max > 0:
-                    edge_candidates = build_edge_candidates(
-                        triangles.vertices,
-                        triangles._triangle_indices,
-                        k=k_edge,
-                    )
-                # ──────────────────────────────────────────────────────────
-
                 # We prune vertices that are no longer used
                 device = triangles.vertices.device
                 used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
@@ -390,7 +381,15 @@ def training(
                 
                 if needs_densification:
                     triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
-   
+
+                # ── 重建边候选图：放在所有三角形增删操作之后 ─────────────
+                if lambda_conn_max > 0:
+                    edge_candidates = build_edge_candidates(
+                        triangles.vertices,
+                        triangles._triangle_indices,
+                        k=k_edge,
+                    )
+                # ──────────────────────────────────────────────────────────
 
                 if iteration > opt.start_opacity_floor:
                     start_iter = opt.start_opacity_floor

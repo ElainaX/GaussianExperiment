@@ -11,7 +11,6 @@ python train.py \
 --lambda_area 1e-4 \
 --tau_edge 0.1 \
 --k_edge 5
---test_iterations 30000
 
 
 python render.py  -m ~/autodl-tmp/output/models/room

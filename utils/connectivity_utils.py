@@ -75,6 +75,10 @@ def connectivity_loss(
     P = T.shape[0]
     dev = vertices.device
 
+    # Shape guard：candidates 与当前三角形数不一致时跳过（prune/densify 后可能过期）
+    if edge_candidates.shape[0] != 3 * P:
+        return torch.tensor(0.0, device=dev)
+
     v0 = vertices[T[:, 0]]
     v1 = vertices[T[:, 1]]
     v2 = vertices[T[:, 2]]
