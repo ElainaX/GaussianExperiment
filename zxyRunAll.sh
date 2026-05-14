@@ -1,4 +1,4 @@
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py \
 -s ~/autodl-tmp/data/mipnerf360/room  \
 -m ~/autodl-tmp/output/models/exp_0.1.0/train02/room \
@@ -17,7 +17,8 @@ python train.py \
 --start_pruning 4000 \
 --start_opacity_floor 5000 \
 --start_vertex_opt 12000 \
---start_upsampling 20000 \
+--start_upsampling 25001 \
+--max_points 1000000 \
 --final_opacity_iter 24000 \
 --sigma_until 30000 \
 --iteration_mesh 5000

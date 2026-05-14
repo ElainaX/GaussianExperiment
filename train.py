@@ -167,7 +167,7 @@ def training(
         # Supersampling
         if iteration == start_upsampling:
             triangles.scaling = opt.upscaling_factor
-        if iteration == start_upsampling + 5000:
+        if iteration == start_upsampling + 5000 and start_upsampling + 5000 <= opt.iterations:
             triangles.scaling = 4
 
         iter_start.record()
