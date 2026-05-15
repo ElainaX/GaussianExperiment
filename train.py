@@ -58,6 +58,7 @@ from utils.connectivity_utils import (
     build_edge_candidates,
     connectivity_loss,
     opacity_solidification_loss,
+    topology_loss,
 )
 
 
@@ -143,9 +144,12 @@ def training(
     lambda_conn_max      = opt.lambda_conn_max
     lambda_opaque_max    = opt.lambda_opaque_max
     lambda_area          = opt.lambda_area
+    lambda_topo          = opt.lambda_topo
     tau_edge             = opt.tau_edge
     k_edge               = opt.k_edge
     edge_candidates      = None   # 首次 prune 后构建
+    boundary_mask        = None   # 由 build_edge_candidates 同步返回
+    low_valence_mask     = None
     # ─────────────────────────────────────────────────────────────────────
 
     depth_l1_weight = get_expon_lr_func(opt.depth_lambda_init, opt.depth_lambda_final, max_steps=opt.iterations)
@@ -160,8 +164,8 @@ def training(
             with torch.no_grad():
                 triangles.run_restricted_delaunay()
             need_delaunay = False
-            if lambda_conn_max > 0:
-                edge_candidates = build_edge_candidates(
+            if lambda_conn_max > 0 or lambda_topo > 0:
+                edge_candidates, boundary_mask, low_valence_mask = build_edge_candidates(
                     triangles.vertices, triangles._triangle_indices, k=k_edge)
 
         # Supersampling
@@ -331,6 +335,16 @@ def training(
         if lambda_area > 0:
             L_area = triangles.compute_area_loss(a_min=opt.area_min)
             loss = loss + lambda_area * L_area
+
+        if iteration > solidification_start and lambda_topo > 0 \
+                and boundary_mask is not None:
+            L_topo = topology_loss(
+                triangles._triangle_indices,
+                triangles.vertex_weight,
+                boundary_mask,
+                low_valence_mask,
+            )
+            loss = loss + lambda_topo * r_t * L_topo
         # ─────────────────────────────────────────────────────────────────
 
         _loss_finite = torch.isfinite(loss)
@@ -343,7 +357,9 @@ def training(
         
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            loss_val = loss.item()
+            if np.isfinite(loss_val):
+                ema_loss_for_log = 0.4 * loss_val + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
@@ -408,8 +424,8 @@ def training(
                     triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
 
                 # ── 重建边候选图：放在所有三角形增删操作之后 ─────────────
-                if lambda_conn_max > 0:
-                    edge_candidates = build_edge_candidates(
+                if lambda_conn_max > 0 or lambda_topo > 0:
+                    edge_candidates, boundary_mask, low_valence_mask = build_edge_candidates(
                         triangles.vertices,
                         triangles._triangle_indices,
                         k=k_edge,

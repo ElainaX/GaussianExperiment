@@ -8,6 +8,7 @@ python train.py \
 --lambda_conn_max 0.01 \
 --lambda_opaque_max 0.005 \
 --lambda_area 1e-4 \
+--lambda_topo 0.001 \
 --tau_edge 0.1 \
 --k_edge 3 \
 --iterations 30000 \
@@ -21,8 +22,7 @@ python train.py \
 --max_points 1000000 \
 --final_opacity_iter 24000 \
 --sigma_until 30000 \
---iteration_mesh 5000 \
---skip_delaunay
+--iteration_mesh 5000
 
 
 

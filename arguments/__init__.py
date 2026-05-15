@@ -150,6 +150,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_conn_max = 0.0
         self.lambda_opaque_max = 0.0
         self.lambda_area = 0.0
+        self.lambda_topo = 0.0
         self.area_min = 1e-6
         self.tau_edge = 0.1
         self.k_edge = 5
