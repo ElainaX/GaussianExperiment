@@ -18,7 +18,7 @@ python train.py \
 --start_pruning 4000 \
 --start_opacity_floor 5000 \
 --start_vertex_opt 12000 \
---start_upsampling 25001 \
+--start_upsampling 20000 \
 --max_points 1000000 \
 --final_opacity_iter 24000 \
 --sigma_until 30000 \

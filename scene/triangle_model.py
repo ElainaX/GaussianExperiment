@@ -30,6 +30,7 @@ import math
 from simple_knn._C import distCUDA2
 import math
 import rdel
+from utils.connectivity_utils import _weld_vertices
 
 
 
@@ -836,6 +837,102 @@ class TriangleModel:
 
 
     
+    def merge_vertex_attribute(self, eps_ratio: float = 1e-4) -> int:
+        """
+        Weld spatially coincident vertices and average their attributes.
+
+        Vertices within eps_ratio × bbox_diagonal of each other are merged into
+        one canonical vertex. Attributes are averaged in activation space where
+        appropriate (opacity), or linearly (positions, SH features).
+
+        Degenerate triangles produced by merging (two or more vertices collapsed
+        to the same canonical ID) are removed.  Optimizer moments are reset to
+        zero for all affected parameter groups because a many-to-one scatter
+        cannot preserve meaningful Adam state.
+
+        Returns the number of vertices that were eliminated.
+        """
+        dev = self.vertices.device
+        V_old = self.vertices.shape[0]
+
+        canonical = _weld_vertices(self.vertices.detach().cpu().numpy(), eps_ratio)
+        n_new = int(canonical.max()) + 1
+
+        if n_new >= V_old:
+            return 0
+
+        can = torch.tensor(canonical, dtype=torch.long, device=dev)  # [V_old]
+
+        # Per-canonical count for averaging
+        counts = torch.zeros(n_new, device=dev, dtype=torch.float32)
+        counts.scatter_add_(0, can, torch.ones(V_old, device=dev))
+
+        def scatter_mean(src: torch.Tensor) -> torch.Tensor:
+            """Average src[V_old, ...] into out[n_new, ...] by canonical ID."""
+            extra = src.shape[1:]
+            idx = can.view(-1, *([1] * len(extra))).expand_as(src)
+            out = torch.zeros((n_new,) + extra, device=dev, dtype=src.dtype)
+            out.scatter_add_(0, idx, src)
+            norm = counts.view((n_new,) + (1,) * len(extra)).clamp(min=1)
+            return out / norm
+
+        # Merge positions
+        new_verts = scatter_mean(self.vertices.detach())
+
+        # Merge opacity in activation space, then map back to logit space
+        opac = self.opacity_activation(self.vertex_weight.detach())   # [V, 1]
+        new_opac = scatter_mean(opac).clamp(self.opacity_floor + self.eps, 1.0 - self.eps)
+        new_weight = self.inverse_opacity_activation(new_opac)
+
+        # Merge SH features
+        new_fdc   = scatter_mean(self._features_dc.detach())
+        new_frest = scatter_mean(self._features_rest.detach())
+
+        # Remap triangle indices and drop degenerate triangles
+        new_tri = can[self._triangle_indices.long()].to(torch.int32)
+        v0, v1, v2 = new_tri[:, 0], new_tri[:, 1], new_tri[:, 2]
+        valid = (v0 != v1) & (v1 != v2) & (v0 != v2)
+        new_tri = new_tri[valid].contiguous()
+
+        if isinstance(self.image_size, torch.Tensor):
+            self.image_size      = self.image_size[valid]
+        if isinstance(self.importance_score, torch.Tensor):
+            self.importance_score = self.importance_score[valid]
+        if isinstance(self.pixel_count, torch.Tensor):
+            self.pixel_count     = self.pixel_count[valid]
+
+        # Replace parameters in optimizer, resetting Adam moments to zero
+        updates = {
+            "vertices":      new_verts,
+            "vertex_weight": new_weight,
+            "f_dc":          new_fdc,
+            "f_rest":        new_frest,
+        }
+        for group in self.optimizer.param_groups:
+            name = group["name"]
+            if name not in updates:
+                continue
+            new_p = nn.Parameter(updates[name].requires_grad_(True))
+            old_p = group["params"][0]
+            if old_p in self.optimizer.state:
+                del self.optimizer.state[old_p]
+            group["params"][0] = new_p
+            self.optimizer.state[new_p] = {
+                "exp_avg":    torch.zeros_like(new_p),
+                "exp_avg_sq": torch.zeros_like(new_p),
+            }
+
+        self.vertices           = updates["vertices"]
+        self.vertex_weight      = updates["vertex_weight"]
+        self._features_dc       = updates["f_dc"]
+        self._features_rest     = updates["f_rest"]
+        self._triangle_indices  = new_tri
+
+        eliminated = V_old - n_new
+        print(f"merge_vertex_attribute: {V_old} → {n_new} vertices ({eliminated} merged, "
+              f"{valid.sum().item()}/{valid.numel()} triangles kept)")
+        return eliminated
+
     def run_restricted_delaunay(self):
 
         print("Running restricted delaunay... for ", self.vertices.shape[0], " vertices.")

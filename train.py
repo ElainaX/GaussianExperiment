@@ -171,7 +171,7 @@ def training(
         # Supersampling
         if iteration == start_upsampling:
             triangles.scaling = opt.upscaling_factor
-        if iteration == start_upsampling + 5000 and start_upsampling + 5000 <= opt.iterations:
+        if iteration == start_upsampling + 5000:
             triangles.scaling = 4
 
         iter_start.record()
@@ -345,6 +345,7 @@ def training(
                 low_valence_mask,
             )
             loss = loss + lambda_topo * r_t * L_topo
+
         # ─────────────────────────────────────────────────────────────────
 
         _loss_finite = torch.isfinite(loss)
@@ -458,6 +459,7 @@ def training(
                     prune_triangles = min(prune_triangles + 0.01, 0.5)
                     mask_out = triangles.vertices.shape[0]
                     triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
+
             
 
             if iteration < opt.iterations:
