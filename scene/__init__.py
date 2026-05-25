@@ -1,21 +1,12 @@
 #
-# The original code is under the following copyright:
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE_GS.md file.
+# under the terms of the LICENSE.md file.
 #
-# For inquiries contact george.drettakis@inria.fr
-#
-# The modifications of the code are under the following copyright:
-# Copyright (C) 2025, University of Liege
-# TELIM research group, http://www.telecom.ulg.ac.be/
-# All rights reserved.
-# The modifications are under the LICENSE.md file.
-#
-# For inquiries contact jan.held@uliege.be
+# For inquiries contact  george.drettakis@inria.fr
 #
 
 import os
@@ -23,21 +14,21 @@ import random
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.triangle_model import TriangleModel
+from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 class Scene:
 
-    triangles : TriangleModel
+    gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, triangles : TriangleModel, init_opacity, set_sigma, load_iteration=None, shuffle=True, resolution_scales=[1.0], segment=False, ratio_threshold=0.75):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
         """b
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
-        self.triangles = triangles
+        self.gaussians = gaussians
 
         if load_iteration:
             if load_iteration == -1:
@@ -72,7 +63,6 @@ class Scene:
                 json.dump(json_cams, file)
 
         if shuffle:
-            random.seed(7)
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
@@ -85,24 +75,16 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
         if self.loaded_iter:
-            self.triangles.load_parameters(os.path.join(self.model_path,
+            self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
-                                                           
-                                                ), segment=segment, ratio_threshold=ratio_threshold
-                                    )
+                                                           "point_cloud.ply"))
         else:
-            self.triangles.create_from_pcd(scene_info.point_cloud, init_opacity, set_sigma)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        print("Save model to: ", point_cloud_path)
-        self.triangles.save_parameters(point_cloud_path)
-
-        return os.path.join(point_cloud_path, 'point_cloud_state_dict.pt')
-
-    def save_mesh(self, iteration):
-        self.triangles.extract_mesh(self.model_path, iteration)
+        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

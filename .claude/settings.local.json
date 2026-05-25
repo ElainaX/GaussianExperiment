@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(move \"e:/Code/github/Reproduce/mesh-splatting/CONNECTIVITY_PLAN.md\" \"e:/Code/github/Reproduce/mesh-splatting/experiments/v0.1.0_edge-connectivity-solidification.md\")",
-      "PowerShell(New-Item -ItemType Directory -Force \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\experiments\")",
-      "PowerShell(Move-Item \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\CONNECTIVITY_PLAN.md\" \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\experiments\\\\v0.1.0_edge-connectivity-solidification.md\")"
-    ]
-  }
-}

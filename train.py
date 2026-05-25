@@ -1,108 +1,48 @@
 #
-# The original code is under the following copyright:
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE_GS.md file.
+# under the terms of the LICENSE.md file.
 #
-# For inquiries contact george.drettakis@inria.fr
-#
-# The modifications of the code are under the following copyright:
-# Copyright (C) 2025, University of Liege
-# TELIM research group, http://www.telecom.ulg.ac.be/
-# All rights reserved.
-# The modifications are under the LICENSE.md file.
-#
-# For inquiries contact jan.held@uliege.be
+# For inquiries contact  george.drettakis@inria.fr
 #
 
-import os
 import torch
+import numpy as np
+import os, random, time
 from random import randint
-from utils.loss_utils import l1_loss, ssim, vertex_depth_loss_hr
-from triangle_renderer import render
+from lpipsPyTorch import lpips
+from utils.loss_utils import l1_loss
+from fused_ssim import fused_ssim as fast_ssim
+from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
-from scene import Scene, TriangleModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from scene import Scene, GaussianModel
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams, update_indoor
+from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-import lpips
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-try:
-    from fused_ssim import fused_ssim
-    FUSED_SSIM_AVAILABLE = True
-    print("Using fused SSIM for faster training.")
-except:
-    FUSED_SSIM_AVAILABLE = False
-try:
-    from diff_triangle_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-    print("Sparse Adam optimizer available")
-except:
-    SPARSE_ADAM_AVAILABLE = False
-from utils.render_utils import generate_path, create_videos
-from utils.connectivity_utils import (
-    build_edge_candidates,
-    connectivity_loss,
-    opacity_solidification_loss,
-    topology_loss,
-)
+
+from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
 
-def log_cuda_memory(iteration: int, log_path: str) -> None:
-    allocated = torch.cuda.memory_allocated() / 1024**3
-    reserved  = torch.cuda.memory_reserved()  / 1024**3
-    peak      = torch.cuda.max_memory_allocated() / 1024**3
-    line = (f"iter {iteration:>6d} | "
-            f"allocated {allocated:.3f} GiB | "
-            f"reserved {reserved:.3f} GiB | "
-            f"peak {peak:.3f} GiB\n")
-    with open(log_path, "a") as f:
-        f.write(line)
-
-
-def training(
-        dataset,   
-        opt, 
-        pipe,
-        testing_iterations,
-        checkpoint, 
-        debug_from,
-        scene_name,
-        use_sparse_adam=False
-        ):
-    
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-
-    os.makedirs("experiments", exist_ok=True)
-    cuda_log_path = os.path.join("experiments", "v0.1.0_cuda_memory.txt")
-
-    # Load parameters, triangles and scene
-    triangles = TriangleModel(dataset.sh_degree)
-
-    scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
-
-    triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
-    triangles.add_percentage = opt.add_percentage
-
-
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
-        triangles.restore(model_params, opt)
+        gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -111,404 +51,138 @@ def training(
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = scene.getTrainCameras().copy()
-    number_of_training_views = len(viewpoint_stack)
+    viewpoint_indices = list(range(len(viewpoint_stack)))
+
+    # record time
+    optim_start = torch.cuda.Event(enable_timing=True)
+    optim_end = torch.cuda.Event(enable_timing=True)
+    total_time = 0.0
 
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-
-    # define the scheduler for sigma and opacity
-    initial_sigma = opt.set_sigma
-    final_sigma = 0.0001
-    sigma_start = opt.sigma_start
-    total_iters = opt.sigma_until
-
-    init_opacity = 0.1
-    final_opacity = .9999
-    total_iters_opacity = opt.final_opacity_iter
-
-    lambda_weight = opt.lambda_weight
-    prune_triangles = opt.prune_triangles_threshold
-    prune_size = opt.prune_size
-    start_upsampling = opt.start_upsampling
-    splitt_large_triangles = opt.splitt_large_triangles
-    triangles.size_probs_zero = opt.size_probs_zero
-    triangles.size_probs_zero_image_space = opt.size_probs_zero_image_space
-    
-    need_delaunay = False
-
-    run_restricted_delaunay = opt.iterations + 1 if opt.skip_delaunay else opt.densify_until_iter + 1000
-
-    # ── Connectivity Solidification 超参 ─────────────────────────────────
-    solidification_start = opt.solidification_start
-    lambda_conn_max      = opt.lambda_conn_max
-    lambda_opaque_max    = opt.lambda_opaque_max
-    lambda_area          = opt.lambda_area
-    lambda_topo          = opt.lambda_topo
-    tau_edge             = opt.tau_edge
-    k_edge               = opt.k_edge
-    edge_candidates      = None   # 首次 prune 后构建
-    boundary_mask        = None   # 由 build_edge_candidates 同步返回
-    low_valence_mask     = None
-    # ─────────────────────────────────────────────────────────────────────
-
-    depth_l1_weight = get_expon_lr_func(opt.depth_lambda_init, opt.depth_lambda_final, max_steps=opt.iterations)
+    bg = torch.rand((3), device="cuda") if opt.random_background else background
 
     for iteration in range(first_iter, opt.iterations + 1):
 
-        cache_interval = 100 if iteration >= start_upsampling else 500
-        if iteration % cache_interval == 0:
-            torch.cuda.empty_cache()
-
-        if need_delaunay:
-            with torch.no_grad():
-                triangles.run_restricted_delaunay()
-            need_delaunay = False
-            if lambda_conn_max > 0 or lambda_topo > 0:
-                edge_candidates, boundary_mask, low_valence_mask = build_edge_candidates(
-                    triangles.vertices, triangles._triangle_indices, k=k_edge)
-
-        # Supersampling
-        if iteration == start_upsampling:
-            triangles.scaling = opt.upscaling_factor
-        if iteration == start_upsampling + 5000:
-            triangles.scaling = 4
+        if websockets:
+            if network_gui_ws.curr_id >= 0 and network_gui_ws.curr_id < len(scene.getTrainCameras()):
+                cam = scene.getTrainCameras()[network_gui_ws.curr_id]
+                net_image = render_fastgs(cam, gaussians, pipe, background, opt.mult, 1.0)["render"]
+                network_gui_ws.latest_width = cam.image_width
+                network_gui_ws.latest_height = cam.image_height
+                network_gui_ws.latest_result = net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
 
         iter_start.record()
-        triangles.update_learning_rate(iteration)
-
-        # Sigma schedule
-        if iteration < sigma_start:
-            current_sigma = initial_sigma
-        else:
-            progress = (iteration - sigma_start) / (total_iters - sigma_start)
-            progress = min(progress, 1.0)
-            current_sigma = initial_sigma - (initial_sigma - final_sigma) * progress
-        triangles.set_sigma(current_sigma)
+        
+        gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
-            triangles.oneupSHdegree()
+            gaussians.oneupSHdegree()
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_indices = list(range(len(viewpoint_stack)))
+        rand_idx = randint(0, len(viewpoint_indices) - 1)
+        viewpoint_cam = viewpoint_stack.pop(rand_idx)
+        _ = viewpoint_indices.pop(rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
-
-        if not viewpoint_stack or len(scene.getTrainCameras()) + iteration == opt.iterations:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            if len(scene.getTrainCameras()) + iteration == opt.iterations:
-                triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda") # reset to 0 to ensure that everything is deleted with an importance score of 0
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
-        render_pkg = render(viewpoint_cam, triangles, pipe, bg)
-        image = render_pkg["render"]
+        render_pkg = render_fastgs(viewpoint_cam, gaussians, pipe, bg, opt.mult)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        if getattr(viewpoint_cam, "normal_map", None) is not None:
-            gt_normal = viewpoint_cam.normal_map.cuda()
-            seg_hr = gt_normal.unsqueeze(0)  # -> [1, 3, H, W]
-            seg_ds_area = F.interpolate(seg_hr, size=(gt_image.shape[1], gt_image.shape[2]), mode="area")  # [1, 3, H0, W0]
-            gt_normal = seg_ds_area.squeeze(0)  # -> [3, H0, W0]
-        else:
-            gt_normal = None
+        Ll1 = l1_loss(image, gt_image)
+        ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss.backward()
 
-        pixel_loss = l1_loss(image, gt_image)
-
-        image_size = render_pkg["scaling"].detach()
-        mask = image_size > triangles.image_size
-        triangles.image_size[mask] = image_size[mask]
-
-        importance_score = render_pkg["max_blending"].detach()
-        mask = importance_score > triangles.importance_score
-        triangles.importance_score[mask] = importance_score[mask]
-
-        pixel_count = render_pkg["triangle_was_rendered"].detach() # Not used but could be useful. Gives per triangle, the number of pixels it covered in the current render
-        mask = pixel_count > triangles.pixel_count
-        triangles.pixel_count[mask] = pixel_count[mask]
-
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
-
-        loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim_value)
-    
-
-        # FINAL LOSS
-        loss = loss_image
-
-        # Opacity loss
-        Lweight_pure = 0.0
-        lambda_weight = opt.lambda_weight if iteration < opt.start_opacity_floor else 0
-        if lambda_weight > 0:
-            mask_out = triangles.vertices.shape[0]
-            vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-            Lweight_pure = vertex_weights.mean()
-            Lweight = lambda_weight * Lweight_pure
-            loss += Lweight
-        else:
-            Lweight = 0
-
-        # Vertex depth regularization
-        Lvertex_depth_pure = 0.0
-        lambda_vertex = opt.lambda_vertex if iteration > opt.start_vertex_opt else 0
-        if lambda_vertex > 0:
-            depth_down = render_pkg["surf_depth"]
-            vertex_depth_out = render_pkg["vertex_depth_out"]
-            image_2D = render_pkg["image_2D"]
-            vertex_rendered = render_pkg["vertex_rendered"]
-            Lvertex_depth_pure = vertex_depth_loss_hr(
-                vertex_depth_out,
-                image_2D,
-                vertex_rendered,
-                depth_down,
-                max_diff_threshold=opt.max_diff_threshold,
-            )
-            Lvertex_depth = lambda_vertex * Lvertex_depth_pure
-            loss += Lvertex_depth
-        else:
-            Lvertex_depth = 0
-
-        # Depth loss
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and getattr(viewpoint_cam, "invdepthmap", None) is not None:
-            invDepth = 1.0 / (render_pkg["expected_depth"] + 1e-6)
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-        else:
-            Ll1depth = 0
-
-        rend_normal = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
-
-        # Normal regularization (2DGS)
-        Lnormal_pure = 0.0
-        lambda_normal = opt.lambda_normals if iteration > opt.iteration_mesh else 0
-        if lambda_normal > 0:
-            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-            Lnormal_pure = normal_error.mean()
-            Lnormal = lambda_normal * Lnormal_pure
-            loss += Lnormal
-        else:
-            Lnormal = 0
-
-        # supervised normal loss
-        if gt_normal is not None:
-            lambda_normals_super = opt.lambda_normals_super if iteration > opt.iteration_mesh else 0
-            normal_error = (1 - (rend_normal * gt_normal).sum(dim=0))[None]
-            normal_loss_super = lambda_normals_super * (normal_error).mean()
-            loss += normal_loss_super
-
-        # ── Connectivity Solidification losses ───────────────────────────
-        r_t = min(1.0, max(0.0,
-            (iteration - solidification_start) /
-            max(1, opt.iterations - solidification_start)
-        ))
-
-        if iteration > solidification_start and lambda_conn_max > 0 \
-                and edge_candidates is not None:
-            L_conn = connectivity_loss(
-                triangles.vertices,
-                triangles._triangle_indices,
-                edge_candidates,
-                triangles.importance_score,
-                triangles.vertex_weight,
-                tau=tau_edge,
-            )
-            loss = loss + lambda_conn_max * r_t * L_conn
-
-        if iteration > solidification_start and lambda_opaque_max > 0:
-            L_opaque = opacity_solidification_loss(
-                triangles.vertex_weight,
-                triangles._triangle_indices,
-                triangles.importance_score,
-                importance_threshold=prune_triangles,
-            )
-            loss = loss + lambda_opaque_max * r_t * L_opaque
-
-        if lambda_area > 0:
-            L_area = triangles.compute_area_loss(a_min=opt.area_min)
-            loss = loss + lambda_area * L_area
-
-        if iteration > solidification_start and lambda_topo > 0 \
-                and boundary_mask is not None:
-            L_topo = topology_loss(
-                triangles._triangle_indices,
-                triangles.vertex_weight,
-                boundary_mask,
-                low_valence_mask,
-            )
-            loss = loss + lambda_topo * r_t * L_topo
-
-        # ─────────────────────────────────────────────────────────────────
-
-        _loss_finite = torch.isfinite(loss)
-        if _loss_finite:
-            loss.backward()
-        else:
-            print(f"[iter {iteration}] WARNING: non-finite loss, skipping backward.")
         iter_end.record()
 
-        
         with torch.no_grad():
             # Progress bar
-            loss_val = loss.item()
-            if np.isfinite(loss_val):
-                ema_loss_for_log = 0.4 * loss_val + 0.6 * ema_loss_for_log
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                loss_dict = {
-                    "Loss": f"{ema_loss_for_log:.{5}f}",
-                }
-                progress_bar.set_postfix(loss_dict)
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            iter_time = iter_start.elapsed_time(iter_end)
             # Log and save
+            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_time, testing_iterations, scene, render_fastgs, (pipe, background, opt.mult))
+            if (iteration in saving_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
             
-            training_report(tb_writer, scene_name, iteration, pixel_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-
-            # Handle pruning operations
-            if iteration % 500 == 0 and iteration < run_restricted_delaunay:
-                
-                # Building masks to delete triangles
-                triangle_vertex_weights = triangles.opacity_activation(
-                    triangles.vertex_weight[triangles._triangle_indices]
-                ) 
-                min_weights = triangle_vertex_weights.min(dim=1).values
-
-                mask_opacity     = (min_weights <= prune_triangles).squeeze()              # delete if too low
-                mask_importance  = (triangles.importance_score <= prune_triangles).squeeze()  # delete if too low
-                mask_size        = (triangles.image_size > prune_size).squeeze()                 # delete if too big
-
-                delete_mask = mask_opacity | mask_size
-
-                if number_of_training_views < 500: # only delete if the number of views are below 500. Otherwise, we might delete too much
-                    delete_mask = delete_mask | mask_importance
-
-                keep_mask   = ~delete_mask 
-
-                if iteration > opt.start_pruning:
-                    triangles.prune_triangles(keep_mask)
-
-                # We prune vertices that are no longer used
-                device = triangles.vertices.device
-                used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
-                                            dtype=torch.bool, 
-                                            device=device)
-                if triangles._triangle_indices.numel() > 0:
-                    flat_indices = triangles._triangle_indices.flatten()
-                    used_vertex_mask[flat_indices] = True
-                
-                weight_mask = (triangles.get_vertex_weight.squeeze() >= prune_triangles)
-                mask_out = triangles.vertices.shape[0]
-                vertex_mask = weight_mask[:mask_out] | used_vertex_mask
-
-                triangles._prune_vertices(vertex_mask)
-
-
-                triangle_vertex_weights = triangles.opacity_activation(
-                    triangles.vertex_weight[triangles._triangle_indices]
-                )  # [T,3]
-
-                needs_densification = (iteration < opt.densify_until_iter and 
-                                     iteration % opt.densification_interval == 0 and 
-                                     iteration > opt.densify_from_iter)
-                
-                if needs_densification:
-                    triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
-
-                # ── 重建边候选图：放在所有三角形增删操作之后 ─────────────
-                if lambda_conn_max > 0 or lambda_topo > 0:
-                    edge_candidates, boundary_mask, low_valence_mask = build_edge_candidates(
-                        triangles.vertices,
-                        triangles._triangle_indices,
-                        k=k_edge,
-                    )
-                # ──────────────────────────────────────────────────────────
-
-                if iteration > opt.start_opacity_floor:
-                    start_iter = opt.start_opacity_floor
-                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
-                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
-                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
-                    current_opacity = min(current_opacity, final_opacity)
-                    triangles.update_min_weight(current_opacity)
-
-                    prune_triangles = min(prune_triangles + 0.01, 0.5)
-                    mask_out = triangles.vertices.shape[0]
-                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-            elif iteration == run_restricted_delaunay:
-                need_delaunay = True
-            elif iteration % 500 == 0 and iteration > run_restricted_delaunay + 1000:
-
-                if iteration > opt.start_opacity_floor:
-                    start_iter = opt.start_opacity_floor
-                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
-                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
-                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
-                    current_opacity = min(current_opacity, final_opacity)
-                    triangles.update_min_weight(current_opacity)
-
-                    prune_triangles = min(prune_triangles + 0.01, 0.5)
-                    mask_out = triangles.vertices.shape[0]
-                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-
+            optim_start.record()
             
+            # Densification
+            if iteration < opt.densify_until_iter:
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    my_viewpoint_stack = scene.getTrainCameras().copy()
+                    camlist = sampling_cameras(my_viewpoint_stack)
+
+                    # The multiview consistent densification of fastgs
+                    importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, DENSIFY=True)                    
+                    gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
+                                                min_opacity = 0.005, 
+                                                extent = scene.cameras_extent, 
+                                                radii=radii,
+                                                args = opt,
+                                                importance_score = importance_score,
+                                                pruning_score = pruning_score)
+
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
+
+            # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
+            # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
+            # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
+            if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+                my_viewpoint_stack = scene.getTrainCameras().copy()
+                camlist = sampling_cameras(my_viewpoint_stack)
+
+                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
+                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+        
+            # Optimization step
             if iteration < opt.iterations:
-                if _loss_finite:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for g in triangles.optimizer.param_groups
-                           for p in g['params'] if p.grad is not None],
-                        max_norm=1.0,
-                    )
-                    triangles.optimizer.step()
-                triangles.optimizer.zero_grad(set_to_none = True)
-                if iteration % 100 == 0:
-                    log_cuda_memory(iteration, cuda_log_path)
+                if opt.optimizer_type == "default":
+                    gaussians.optimizer_step(iteration)
+                elif opt.optimizer_type == "sparse_adam":
+                    visible = radii > 0
+                    gaussians.optimizer.step(visible, radii.shape[0])
+                    gaussians.optimizer.zero_grad(set_to_none = True)
 
-    # cleaning of triangles that we do not need
-    viewpoint_stack = scene.getTrainCameras().copy()
-    triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
-    while viewpoint_stack:
-        viewpoint_cam = viewpoint_stack.pop(0)
-        render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+            # record time
+            optim_end.record()
+            torch.cuda.synchronize()
+            optim_time = optim_start.elapsed_time(optim_end)
+            total_time += (iter_time + optim_time) / 1e3
 
-        importance_score = render_pkg["max_blending"].detach()
-        mask = importance_score > triangles.importance_score
-        triangles.importance_score[mask] = importance_score[mask]
-    mask_importance  = (triangles.importance_score <= 0.5).squeeze() 
-    triangles.prune_triangles(~mask_importance) # delete all the remaining triangles that do not have an influence
-
-    device = triangles.vertices.device
-    used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
-                                dtype=torch.bool, 
-                                device=device)
-    if triangles._triangle_indices.numel() > 0:
-        # Flatten indices and mark used vertices
-        flat_indices = triangles._triangle_indices.flatten()
-        used_vertex_mask[flat_indices] = True
+    # scene.save(iteration)
+    print(f"Gaussian number: {gaussians._xyz.shape[0]}")
+    print(f"Training time: {total_time}")
     
-    vertex_mask = used_vertex_mask
-    triangles._prune_vertices(vertex_mask)
-
-    scene.save(iteration)          
-    print("Training is done")
-
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        args.model_path = os.path.join("./output/", unique_str)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -524,59 +198,47 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/pixel_loss', pixel_loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    if iteration % 1000 == 0:
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                pixel_loss_test = 0.0
-                psnr_test = 0.0
-                ssim_test = 0.0
-                lpips_test = 0.0
-                total_time = 0.0
+                l1_test = 0.0
+                psnr_test, ssim_test, lpips_test = 0.0, 0.0, 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                    image = torch.clamp(renderFunc(viewpoint, scene.triangles, *renderArgs)["render"], 0.0, 1.0)
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    runtime = start_event.elapsed_time(end_event)
-                    total_time += runtime
-
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    pixel_loss_test += loss_fn(image, gt_image).mean().double()
+                    l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
-                    ssim_test += ssim(image, gt_image).mean().double()
-                    lpips_test += lpips_fn(image, gt_image).mean().double()
+                    ssim_test += fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+                    lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
                 psnr_test /= len(config['cameras'])
-                pixel_loss_test /= len(config['cameras'])       
                 ssim_test /= len(config['cameras'])
-                lpips_test /= len(config['cameras'])  
-                total_time /= len(config['cameras'])
-                fps = 1000.0 / total_time
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} FPS {}".format(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test, fps))
-
+                lpips_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])          
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
 
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -585,47 +247,40 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-
-    parser.add_argument('--wandb_name', default="Test", type=str)
-    parser.add_argument('--scene_name', default="Garden", type=str)
-    parser.add_argument("--use_sparse_adam", action="store_true", default=True)
-    parser.add_argument("--indoor", action="store_true", default=False)
-
+    parser.add_argument("--websockets", action='store_true', default=False)
+    parser.add_argument("--benchmark_dir", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-
+    
     print("Optimizing " + args.model_path)
-
-    lpips_fn = lpips.LPIPS(net='vgg').to(device="cuda")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    lps = lp.extract(args)
-    ops = op.extract(args)
-    pps = pp.extract(args)
-
-    if args.indoor:
-        ops = update_indoor(ops)
-
-    # Configure and run training
+    if(args.websockets):
+        network_gui_ws.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lps,
-             ops,
-             pps,
-             args.test_iterations,
-             args.start_checkpoint,
-             args.debug_from,
-             args.scene_name,
-             use_sparse_adam=args.use_sparse_adam
-             )
     
+    training(
+        lp.extract(args), 
+        op.extract(args), 
+        pp.extract(args), 
+        args.test_iterations, 
+        args.save_iterations, 
+        args.checkpoint_iterations, 
+        args.start_checkpoint, 
+        args.debug_from, 
+        args.websockets
+    )
+
     # All done
     print("\nTraining complete.")

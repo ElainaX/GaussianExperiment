@@ -13,62 +13,10 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-import torch
-import cv2
 
 WARNED = False
 
-import numpy as np, torch
-from pathlib import Path
-
-def to_depth_tensor(depth_in):
-    if depth_in is None:
-        return None
-
-    # If it's a path, load the .npy
-    if isinstance(depth_in, (str, Path)):
-        arr = np.load(depth_in).astype(np.float32)
-        if arr.ndim == 2: arr = arr[..., None]         # [H,W] -> [H,W,1]
-        t = torch.from_numpy(arr)                      # [H,W,1]
-        return t.permute(2,0,1).contiguous()           # [1,H,W]
-
-    # If it's already a numpy array
-    if isinstance(depth_in, np.ndarray):
-        arr = depth_in.astype(np.float32)
-        if arr.ndim == 2: arr = arr[..., None]
-        t = torch.from_numpy(arr)
-        return t.permute(2,0,1).contiguous()
-
-    # If it's already a tensor
-    if torch.is_tensor(depth_in):
-        t = depth_in.float()
-        # allow [H,W], [H,W,1], [1,H,W]
-        if t.ndim == 2:    t = t.unsqueeze(0)          # [H,W]   -> [1,H,W]
-        elif t.ndim == 3 and t.shape[-1] == 1: t = t.permute(2,0,1)  # [H,W,1] -> [1,H,W]
-        # if it's already [1,H,W], keep it
-        return t.contiguous()
-
-    raise TypeError(f"Unsupported depth type: {type(depth_in)}")
-
 def loadCam(args, id, cam_info, resolution_scale):
-
-
-    if cam_info.depth_path != "":
-        try:
-            invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
-
-        except FileNotFoundError:
-            print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
-            raise
-        except IOError:
-            print(f"Error: Unable to open the image file '{cam_info.depth_path}'. It may be corrupted or an unsupported format.")
-            raise
-        except Exception as e:
-            print(f"An unexpected error occurred when trying to read depth at {cam_info.depth_path}: {e}")
-            raise
-    else:
-        invdepthmap = None
-
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
@@ -90,25 +38,18 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    if len(cam_info.image.split()) > 3:
-        resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
-        loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
-        gt_image = resized_image_rgb
-    else:
-        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = None
-        gt_image = resized_image_rgb
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
-    normal_map = getattr(cam_info, 'normal_map', None)
-    if normal_map is not None:
-        normal_map = torch.from_numpy(normal_map).permute(2, 0, 1).float()  # [3, H, W]
-    else:
-        normal_map = None
+    gt_image = resized_image_rgb[:3, ...]
+    loaded_mask = None
+
+    if resized_image_rgb.shape[1] == 4:
+        loaded_mask = resized_image_rgb[3:4, ...]
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,  depth_params=cam_info.depth_params, invdepthmap=invdepthmap,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, normal_map=normal_map)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

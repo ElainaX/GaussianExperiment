@@ -1,101 +1,27 @@
 #
-# The original code is under the following copyright:
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE_GS.md file.
+# under the terms of the LICENSE.md file.
 #
-# For inquiries contact george.drettakis@inria.fr
-#
-# The modifications of the code are under the following copyright:
-# Copyright (C) 2024, University of Liege, KAUST and University of Oxford
-# TELIM research group, http://www.telecom.ulg.ac.be/
-# IVUL research group, https://ivul.kaust.edu.sa/
-# VGG research group, https://www.robots.ox.ac.uk/~vgg/
-# All rights reserved.
-# The modifications are under the LICENSE.md file.
-#
-# For inquiries contact jan.held@uliege.be
+# For inquiries contact  george.drettakis@inria.fr
 #
 
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
-import numpy as np
 
-def vertex_depth_loss_hr(vertex_depth_out, image_2D, vertex_rendered, depth_full_hr, max_diff_threshold=0.5, iteration=10):
-    assert depth_full_hr.dim() == 3 and depth_full_hr.size(0) == 1, "depth_full_hr must be (1,H,W)"
-
-    v_depths = vertex_depth_out
-    v_coords = image_2D.to(depth_full_hr)  # [y, x] as float
-
-    H, W = depth_full_hr.shape[1], depth_full_hr.shape[2]
-
-    # SWAPPED: v_coords stores [y, x] not [x, y]
-    y = v_coords[:, 1]  # height dimension - FIRST COLUMN
-    x = v_coords[:, 0]  # width dimension - SECOND COLUMN
-
-    # inside image
-    inside = (x >= 0) & (x < W) & (y >= 0) & (y < H)
-
-    keep = inside
-    
-    if not torch.any(keep):
-        print("NO values")
-        return torch.tensor(0.0, device=vertex_depth_out.device, dtype=vertex_depth_out.dtype)
-
-    x = x[keep]; y = y[keep]; v_depths = v_depths[keep]
-
-    # round to nearest pixel, then clamp for safety
-    x_idx = torch.clamp(torch.round(x).long(), 0, W - 1)  # width indices
-    y_idx = torch.clamp(torch.round(y).long(), 0, H - 1)  # height indices
-
-    # Sampling with proper indices
-    sampled = depth_full_hr[0, y_idx, x_idx]
-
-    valid = torch.isfinite(sampled) & (sampled > 0)
-    if not torch.any(valid):
-        return torch.tensor(0.0, device=vertex_depth_out.device, dtype=vertex_depth_out.dtype)
-
-    diffs = torch.abs((v_depths[valid] - sampled[valid]))
-    use = diffs < max_diff_threshold
-    if not torch.any(use):
-        return torch.tensor(0.0, device=vertex_depth_out.device, dtype=vertex_depth_out.dtype)
-    
-    return diffs[use].mean()
-
-
-def u_shaped_opacity_loss(x, center=0.1, width=0.03):
-    # Normalized distance to center (e.g., 0.1)
-    penalty = torch.exp(-((x - center) ** 2) / (2 * width ** 2))
-    return penalty.mean()
-
-def binarization_loss(x, eps=1e-6):
-    x = torch.clamp(x, eps, 1 - eps)  # avoid log(0)
-    return -x * torch.log(x) - (1 - x) * torch.log(1 - x)
-
+C1 = 0.01 ** 2
+C2 = 0.03 ** 2
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
-
-def lp_loss(pred, target, p=0.7, eps=1e-6):
-    """
-    Computes Lp loss with 0 < p < 1.
-    Args:
-        pred: (N, C, H, W) predicted image
-        target: (N, C, H, W) groundtruth image
-        p: norm degree < 1
-        eps: small constant for numerical stability
-    """
-    diff = torch.abs(pred - target) + eps
-    loss = torch.pow(diff, p).mean()
-    return loss
 
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -110,6 +36,7 @@ def create_window(window_size, channel):
 def ssim(img1, img2, window_size=11, size_average=True):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
+
     if img1.is_cuda:
         window = window.cuda(img1.get_device())
     window = window.type_as(img1)
