@@ -82,7 +82,7 @@
 		 const float2* normals,
 		 const float* offsets,
 		 const float2* points_xy_image,
-		 const float* vertex_depth, 
+		 const float* vertex_depth,
 		 const int* triangles_indices,
 		 const float sigma,
 		 const float* features,
@@ -94,9 +94,11 @@
 		 uint32_t* n_contrib,
 		 const float* bg_color,
 		 float* out_color,
-		 float* out_others, 
+		 float* out_others,
 		 float* max_blending,
-		 int* was_rendered);
+		 int* was_rendered,
+		 const float* metric_map = nullptr,
+		 int* accum_error_counts = nullptr);
  }
  
  

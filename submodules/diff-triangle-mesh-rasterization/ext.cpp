@@ -29,4 +29,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mark_visible", &markVisible);
   m.def("compute_relocation", &ComputeRelocationCUDA);
   m.def("adamUpdate", &adamUpdate);
+  m.def("rasterize_triangles_score", &RasterizetrianglesCUDAScore);
 }

@@ -48,6 +48,43 @@ def rasterize_triangles(
         raster_settings,
     )
 
+def rasterize_triangles_score(
+    vertices,
+    triangles_indices,
+    vertex_weights,
+    sigma,
+    sh,
+    colors_precomp,
+    scaling,
+    raster_settings,
+    metric_map,
+):
+    """Score-only forward pass. Returns accum_error_counts (int32, shape [P])."""
+    with torch.no_grad():
+        args = (
+            raster_settings.bg,
+            vertices,
+            triangles_indices,
+            vertex_weights,
+            sigma,
+            colors_precomp,
+            scaling,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.debug,
+            metric_map,
+        )
+        return _C.rasterize_triangles_score(*args)
+
+
 class _RasterizeTriangles(torch.autograd.Function):
     @staticmethod
     def forward(

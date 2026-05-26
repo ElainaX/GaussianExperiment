@@ -20,11 +20,44 @@
 
 import torch
 import math
-from diff_triangle_rasterization import TriangleRasterizationSettings, TriangleRasterizer
+from diff_triangle_rasterization import TriangleRasterizationSettings, TriangleRasterizer, rasterize_triangles_score
 from scene.triangle_model import TriangleModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 import torch.nn.functional as F
+
+def render_score_pass(viewpoint_camera, pc: TriangleModel, pipe, bg_color: torch.Tensor, metric_map: torch.Tensor):
+    """Score-only forward pass (no grad). Returns accum_error_counts [P] int32."""
+    triangles_indices = pc.get_triangle_indices
+    vertices = pc.get_vertices
+    vertex_weights = pc.get_vertex_weight
+    scaling = torch.zeros(triangles_indices.shape[0], dtype=torch.float32, device="cuda")
+
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    H = int(viewpoint_camera.image_height)
+    W = int(viewpoint_camera.image_width)
+
+    raster_settings = TriangleRasterizationSettings(
+        image_height=H, image_width=W,
+        tanfovx=tanfovx, tanfovy=tanfovy,
+        bg=bg_color, scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False, debug=False,
+    )
+
+    shs = pc.get_features
+    colors_precomp = torch.empty(0, device="cuda")
+
+    return rasterize_triangles_score(
+        vertices, triangles_indices, vertex_weights.squeeze(), pc.get_sigma,
+        shs, colors_precomp, scaling, raster_settings,
+        metric_map.contiguous(),
+    )
+
 
 def normals_world_to_view(view, normal_world):
     # normal_world: [H,W,3]

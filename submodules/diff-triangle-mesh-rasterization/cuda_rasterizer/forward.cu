@@ -433,7 +433,7 @@
 	 const float2* __restrict__ normals,
 	 const float* __restrict__ offsets,
 	 const float2* __restrict__ points_xy_image,
-	 const float* __restrict__ vertex_depth, 
+	 const float* __restrict__ vertex_depth,
 	 const int* __restrict__ triangles_indices,
 	 const float sigma,
 	 const float* __restrict__ features,
@@ -447,7 +447,9 @@
 	 float* __restrict__ out_color,
 	 float* __restrict__ out_others,
 	 float* __restrict__ max_blending,
-	 int* __restrict__ was_rendered)
+	 int* __restrict__ was_rendered,
+	 const float* __restrict__ metric_map,
+	 int* __restrict__ accum_error_counts)
  {
 	 // Identify current tile and associated min/max pixel range.
 	 auto block = cg::this_thread_block();
@@ -568,6 +570,8 @@
 				 continue;
 			
 			 atomicAdd(was_rendered + j_id, 1);
+			 if (metric_map != nullptr && metric_map[pix_id] > 0.5f)
+				 atomicAdd(accum_error_counts + j_id, 1);
 
 			 float test_T = T * (1 - alpha);
 			 if (test_T < 0.0001f)
@@ -671,7 +675,7 @@
 	 const float2* normals,
 	 const float* offsets,
 	 const float2* points_xy_image,
-	 const float* vertex_depth, 
+	 const float* vertex_depth,
 	 const int* triangles_indices,
 	 const float sigma,
 	 const float* colors,
@@ -684,8 +688,10 @@
 	 const float* bg_color,
 	 float* out_color,
 	 float* out_others,
-	float* max_blending,
-	int* was_rendered)
+	 float* max_blending,
+	 int* was_rendered,
+	 const float* metric_map,
+	 int* accum_error_counts)
  {
 	 renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		 ranges,
@@ -708,7 +714,9 @@
 		 out_color,
 		 out_others,
 		 max_blending,
-		 was_rendered
+		 was_rendered,
+		 metric_map,
+		 accum_error_counts
 		 );
  }
 

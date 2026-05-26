@@ -97,3 +97,24 @@ void adamUpdate(
 	const uint32_t N,
 	const uint32_t M
 );
+
+torch::Tensor RasterizetrianglesCUDAScore(
+	const torch::Tensor& background,
+	const torch::Tensor& vertices,
+	const torch::Tensor& triangles_indices,
+	const torch::Tensor& vertex_weights,
+	const float sigma,
+	const torch::Tensor& colors,
+	torch::Tensor& scaling,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const torch::Tensor& metric_map);

@@ -239,7 +239,9 @@
 	 float* max_blending,
 	 int* radii,
 	 int* was_rendered,
-	 bool debug)
+	 bool debug,
+	 const float* metric_map,
+	 int* accum_error_counts)
  {
 	 const float focal_y = height / (2.0f * tan_fovy);
 	 const float focal_x = width / (2.0f * tan_fovx);
@@ -387,7 +389,9 @@
 		 out_color,
 		 out_others,
 		 max_blending,
-		 was_rendered), debug)
+		 was_rendered,
+		 metric_map,
+		 accum_error_counts), debug)
  
 	 return num_rendered;
  }

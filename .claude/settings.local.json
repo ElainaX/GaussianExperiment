@@ -3,7 +3,15 @@
     "allow": [
       "Bash(move \"e:/Code/github/Reproduce/mesh-splatting/CONNECTIVITY_PLAN.md\" \"e:/Code/github/Reproduce/mesh-splatting/experiments/v0.1.0_edge-connectivity-solidification.md\")",
       "PowerShell(New-Item -ItemType Directory -Force \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\experiments\")",
-      "PowerShell(Move-Item \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\CONNECTIVITY_PLAN.md\" \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\experiments\\\\v0.1.0_edge-connectivity-solidification.md\")"
+      "PowerShell(Move-Item \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\CONNECTIVITY_PLAN.md\" \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\\\\experiments\\\\v0.1.0_edge-connectivity-solidification.md\")",
+      "Bash(cd \"E:\\\\Code\\\\github\\\\Reproduce\\\\FastGS\" && pwd)",
+      "Read(//e/Code/github/Reproduce/FastGS/**)",
+      "Bash(Get-ChildItem -Recurse -Name -Exclude \".git*\")",
+      "Bash(Get-ChildItem -Path \"e:\\\\Code\\\\github\\\\Reproduce\\\\mesh-splatting\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(xargs grep -l \"TriangleRasterizer\\\\|rasterize_triangles\")",
+      "Read(//mnt/e/Code/github/Reproduce/**)",
+      "Bash(xargs grep -l \"TriangleRasterizer\")"
     ]
   }
 }

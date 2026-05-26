@@ -33,7 +33,7 @@ def run(input_verts: np.ndarray, input_faces: np.ndarray, verbose: bool = False,
 
 
     # Upload BVH and mesh
-    start_time = time.time()
+    start_time: float = time.time()
     upload_bvh_and_mesh(bvh, verts, faces)
     end_time = time.time()
     logging.info(f"[BVH Upload] {end_time - start_time} sec")

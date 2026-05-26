@@ -770,7 +770,7 @@ class TriangleModel:
             sampled_idxs = alive_indices[sampled_idxs]
         return sampled_idxs        
 
-    def add_new_gs(self, iteration, cap_max, splitt_large_triangles):
+    def add_new_gs(self, iteration, cap_max, splitt_large_triangles, score_weights=None):
 
         current_num_points = self.vertices.shape[0]
         target_num = min(cap_max, int(self.add_percentage * current_num_points))
@@ -782,6 +782,13 @@ class TriangleModel:
         # Find indexes based on proba
         triangle_transp = self.importance_score
         probs = triangle_transp.squeeze()
+
+        # Blend with multi-view error scores when provided (FastGS strategy)
+        if score_weights is not None and score_weights.shape[0] == probs.shape[0]:
+            sw = score_weights.to(probs.device)
+            sw = sw / sw.sum().clamp(min=1e-8)
+            base = probs / probs.sum().clamp(min=1e-8)
+            probs = 0.5 * base + 0.5 * sw
 
         areas = self.triangle_areas().squeeze()
         probs = torch.where(areas < self.size_probs_zero, torch.zeros_like(probs), probs)

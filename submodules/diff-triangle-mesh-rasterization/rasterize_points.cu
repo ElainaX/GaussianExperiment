@@ -135,6 +135,92 @@ RasterizetrianglesCUDA(
   return std::make_tuple(rendered, out_color, out_others, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending);
 }
 
+torch::Tensor RasterizetrianglesCUDAScore(
+	const torch::Tensor& background,
+	const torch::Tensor& vertices,
+	const torch::Tensor& triangles_indices,
+	const torch::Tensor& vertex_weights,
+	const float sigma,
+	const torch::Tensor& colors,
+	torch::Tensor& scaling,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const bool debug,
+	const torch::Tensor& metric_map)
+{
+  const int P = triangles_indices.size(0);
+  const int V = vertices.size(0);
+  const int H = image_height;
+  const int W = image_width;
+
+  auto int_opts = vertices.options().dtype(torch::kInt32);
+  auto float_opts = vertices.options().dtype(torch::kFloat32);
+
+  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
+  torch::Tensor radii = torch::full({P}, 0, int_opts);
+  torch::Tensor was_rendered = torch::full({P}, 0, int_opts);
+  torch::Tensor accum_error_counts = torch::zeros({P}, int_opts);
+
+  torch::Device device(torch::kCUDA);
+  torch::TensorOptions options(torch::kByte);
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
+  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+  torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
+  torch::Tensor max_blending = torch::full({P}, 0.0, float_opts);
+
+  const int total_nb_points = P * 3;
+
+  if(P != 0)
+  {
+    int M = 0;
+    if(sh.size(0) != 0)
+      M = sh.size(1);
+
+    const float* metric_ptr = (metric_map.numel() > 0) ? metric_map.contiguous().data_ptr<float>() : nullptr;
+
+    CudaRasterizer::Rasterizer::forward(
+      geomFunc, binningFunc, imgFunc,
+      P, V, degree, M,
+      background.contiguous().data_ptr<float>(),
+      W, H,
+      vertices.contiguous().data_ptr<float>(),
+      triangles_indices.contiguous().data_ptr<int>(),
+      vertex_weights.contiguous().data_ptr<float>(),
+      sigma,
+      total_nb_points,
+      sh.contiguous().data_ptr<float>(),
+      colors.contiguous().data_ptr<float>(),
+      scaling.contiguous().data_ptr<float>(),
+      viewmatrix.contiguous().data_ptr<float>(),
+      projmatrix.contiguous().data_ptr<float>(),
+      campos.contiguous().data_ptr<float>(),
+      tan_fovx, tan_fovy,
+      prefiltered,
+      out_color.contiguous().data_ptr<float>(),
+      out_others.contiguous().data_ptr<float>(),
+      max_blending.contiguous().data_ptr<float>(),
+      radii.contiguous().data_ptr<int>(),
+      was_rendered.contiguous().data_ptr<int>(),
+      debug,
+      metric_ptr,
+      accum_error_counts.contiguous().data_ptr<int>());
+  }
+  return accum_error_counts;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizetrianglesBackwardCUDA(
  	const torch::Tensor& background,

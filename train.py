@@ -22,7 +22,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, vertex_depth_loss_hr
-from triangle_renderer import render
+from triangle_renderer import render, render_score_pass
 import sys
 from scene import Scene, TriangleModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -60,6 +60,7 @@ from utils.connectivity_utils import (
     opacity_solidification_loss,
     topology_loss,
 )
+from utils.fast_triangle_utils import compute_triangle_score, prune_low_score_triangles
 
 
 def log_cuda_memory(iteration: int, log_path: str) -> None:
@@ -422,7 +423,13 @@ def training(
                                      iteration > opt.densify_from_iter)
                 
                 if needs_densification:
-                    triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
+                    mv_score = compute_triangle_score(
+                        triangles, scene.getTrainCameras(), render_score_pass, pipe, background,
+                        loss_thresh=0.02, max_views=8,
+                    )
+                    triangles.add_new_gs(iteration, cap_max=opt.max_points,
+                                         splitt_large_triangles=splitt_large_triangles,
+                                         score_weights=mv_score)
 
                 # ── 重建边候选图：放在所有三角形增删操作之后 ─────────────
                 if lambda_conn_max > 0 or lambda_topo > 0:
@@ -459,6 +466,16 @@ def training(
                     prune_triangles = min(prune_triangles + 0.01, 0.5)
                     mask_out = triangles.vertices.shape[0]
                     triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
+
+                # FastGS-style post-convergence prune every 3000 iters
+                if iteration % 3000 == 0:
+                    mv_score = compute_triangle_score(
+                        triangles, scene.getTrainCameras(), render_score_pass, pipe, background,
+                        loss_thresh=0.02, max_views=8,
+                    )
+                    n_pruned = prune_low_score_triangles(triangles, mv_score, keep_ratio=0.95)
+                    if n_pruned > 0:
+                        print(f"[FastGS] iter {iteration}: pruned {n_pruned} low-score triangles")
 
             
 
