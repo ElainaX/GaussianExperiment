@@ -423,10 +423,14 @@ def training(
                                      iteration > opt.densify_from_iter)
                 
                 if needs_densification:
-                    mv_score = compute_triangle_score(
-                        triangles, scene.getTrainCameras(), render_score_pass, pipe, background,
-                        loss_thresh=0.02, max_views=8,
-                    )
+                    # Only compute multi-view score every 2000 iters to avoid 8-render overhead
+                    if iteration % 2000 == 0:
+                        mv_score = compute_triangle_score(
+                            triangles, scene.getTrainCameras(), render_score_pass, pipe, background,
+                            loss_thresh=0.02, max_views=4,
+                        )
+                    else:
+                        mv_score = None
                     triangles.add_new_gs(iteration, cap_max=opt.max_points,
                                          splitt_large_triangles=splitt_large_triangles,
                                          score_weights=mv_score)
