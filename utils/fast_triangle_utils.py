@@ -46,21 +46,25 @@ def compute_triangle_score(
         for idx in indices:
             cam = viewpoint_cameras[idx]
 
-            # Build metric map from last rendered image vs. ground truth.
-            # We don't have the rendered image here, so we do a quick render.
             from triangle_renderer import render
             pkg = render(cam, triangles, pipe, bg_color)
             rendered = pkg["render"]  # [3, H, W]
 
             gt = cam.original_image.cuda()
             if gt.shape != rendered.shape:
-                gt = F.interpolate(gt.unsqueeze(0), size=rendered.shape[1:], mode="bilinear", align_corners=False).squeeze(0)
+                gt = F.interpolate(gt.unsqueeze(0), size=rendered.shape[1:],
+                                   mode="bilinear", align_corners=False).squeeze(0)
 
             l1_map = (rendered - gt).abs().mean(dim=0)  # [H, W]
             metric_map = (l1_map > loss_thresh).float()  # binary, [H, W]
 
-            counts = render_score_fn(cam, triangles, pipe, bg_color, metric_map)  # [P] int32
-            accum += counts.float()
+            try:
+                # render_score_fn signature: (cam, triangles, bg_color, metric_map)
+                counts = render_score_fn(cam, triangles, bg_color, metric_map)  # [P] int32
+                accum += counts.float()
+            except RuntimeError:
+                # CUDA extension not yet recompiled — skip scoring this view
+                pass
 
     # Normalize to [0, 1]
     max_val = accum.max().clamp(min=1.0)

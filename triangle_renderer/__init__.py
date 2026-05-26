@@ -20,14 +20,25 @@
 
 import torch
 import math
-from diff_triangle_rasterization import TriangleRasterizationSettings, TriangleRasterizer, rasterize_triangles_score
+from diff_triangle_rasterization import TriangleRasterizationSettings, TriangleRasterizer
+try:
+    from diff_triangle_rasterization import rasterize_triangles_score as _rasterize_triangles_score
+    _SCORE_AVAILABLE = True
+except ImportError:
+    _SCORE_AVAILABLE = False
 from scene.triangle_model import TriangleModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 import torch.nn.functional as F
 
-def render_score_pass(viewpoint_camera, pc: TriangleModel, pipe, bg_color: torch.Tensor, metric_map: torch.Tensor):
-    """Score-only forward pass (no grad). Returns accum_error_counts [P] int32."""
+def render_score_pass(viewpoint_camera, pc: TriangleModel, bg_color: torch.Tensor, metric_map: torch.Tensor):
+    """Score-only forward pass (no grad). Returns accum_error_counts [P] int32.
+    Raises RuntimeError if the CUDA extension has not been recompiled yet."""
+    if not _SCORE_AVAILABLE:
+        raise RuntimeError(
+            "rasterize_triangles_score not available — recompile diff-triangle-mesh-rasterization first."
+        )
+
     triangles_indices = pc.get_triangle_indices
     vertices = pc.get_vertices
     vertex_weights = pc.get_vertex_weight
@@ -52,7 +63,7 @@ def render_score_pass(viewpoint_camera, pc: TriangleModel, pipe, bg_color: torch
     shs = pc.get_features
     colors_precomp = torch.empty(0, device="cuda")
 
-    return rasterize_triangles_score(
+    return _rasterize_triangles_score(
         vertices, triangles_indices, vertex_weights.squeeze(), pc.get_sigma,
         shs, colors_precomp, scaling, raster_settings,
         metric_map.contiguous(),
