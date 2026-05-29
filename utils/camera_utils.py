@@ -3,83 +3,51 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
 import numpy as np
+import torch
+
+from scene.cameras import Camera
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-import torch
-import cv2
 
 WARNED = False
 
-import numpy as np, torch
-from pathlib import Path
 
-def to_depth_tensor(depth_in):
-    if depth_in is None:
-        return None
+def get_rays(W, H, FoVx, FoVy, world_view_transform):
+    fx = fov2focal(FoVx, W)
+    fy = fov2focal(FoVy, H)
 
-    # If it's a path, load the .npy
-    if isinstance(depth_in, (str, Path)):
-        arr = np.load(depth_in).astype(np.float32)
-        if arr.ndim == 2: arr = arr[..., None]         # [H,W] -> [H,W,1]
-        t = torch.from_numpy(arr)                      # [H,W,1]
-        return t.permute(2,0,1).contiguous()           # [1,H,W]
+    K = torch.tensor([[fx, 0, 0.5 * W], [0, fy, 0.5 * H], [0, 0, 1]], device='cuda')
 
-    # If it's already a numpy array
-    if isinstance(depth_in, np.ndarray):
-        arr = depth_in.astype(np.float32)
-        if arr.ndim == 2: arr = arr[..., None]
-        t = torch.from_numpy(arr)
-        return t.permute(2,0,1).contiguous()
+    c2w = world_view_transform.T.inverse()
+    c2w[:3, 1:3] *= -1
 
-    # If it's already a tensor
-    if torch.is_tensor(depth_in):
-        t = depth_in.float()
-        # allow [H,W], [H,W,1], [1,H,W]
-        if t.ndim == 2:    t = t.unsqueeze(0)          # [H,W]   -> [1,H,W]
-        elif t.ndim == 3 and t.shape[-1] == 1: t = t.permute(2,0,1)  # [H,W,1] -> [1,H,W]
-        # if it's already [1,H,W], keep it
-        return t.contiguous()
+    i, j = torch.meshgrid(torch.linspace(0, W - 1, W, device='cuda'), torch.linspace(0, H - 1, H, device='cuda'))
+    i = i.t()
+    j = j.t()
+    dirs = torch.stack([(i - K[0][2]) / K[0][0], -(j - K[1][2]) / K[1][1], -torch.ones_like(i)], -1)
+    rays_d = torch.sum(dirs[..., None, :] * c2w[:3, :3], -1)
+    rays_o = c2w[:3, -1].expand(rays_d.shape)
+    return rays_o, rays_d
 
-    raise TypeError(f"Unsupported depth type: {type(depth_in)}")
 
 def loadCam(args, id, cam_info, resolution_scale):
-
-
-    if cam_info.depth_path != "":
-        try:
-            invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
-
-        except FileNotFoundError:
-            print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
-            raise
-        except IOError:
-            print(f"Error: Unable to open the image file '{cam_info.depth_path}'. It may be corrupted or an unsupported format.")
-            raise
-        except Exception as e:
-            print(f"An unexpected error occurred when trying to read depth at {cam_info.depth_path}: {e}")
-            raise
-    else:
-        invdepthmap = None
-
     orig_w, orig_h = cam_info.image.size
 
-    if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    if args.resolution in [1, 2, 3, 4, 5, 6, 8]:
+        resolution = round(orig_w / (resolution_scale * args.resolution)), round(orig_h / (resolution_scale * args.resolution))
     else:  # should be a type that converts to float
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
                 if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n If this is not desired, please explicitly specify '--resolution/-r' as 1")
                     WARNED = True
                 global_down = orig_w / 1600
             else:
@@ -90,35 +58,38 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    if len(cam_info.image.split()) > 3:
-        resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
-        loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
-        gt_image = resized_image_rgb
-    else:
-        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = None
-        gt_image = resized_image_rgb
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    gt_transparent_mask = PILtoTorch(cam_info.transparent_mask, resolution) > 0
 
-    normal_map = getattr(cam_info, 'normal_map', None)
-    if normal_map is not None:
-        normal_map = torch.from_numpy(normal_map).permute(2, 0, 1).float()  # [3, H, W]
-    else:
-        normal_map = None
+    gt_image = resized_image_rgb
+    loaded_mask = None
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,  depth_params=cam_info.depth_params, invdepthmap=invdepthmap,
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, normal_map=normal_map)
+    if resized_image_rgb.shape[0] == 4:
+        loaded_mask = resized_image_rgb[3:4, ...]
+
+    return Camera(
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        image=gt_image,
+        gt_alpha_mask=loaded_mask,
+        gt_transparent_mask=gt_transparent_mask,
+        image_name=cam_info.image_name,
+        uid=id,
+        data_device=args.data_device,
+    )
+
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
-
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale))
-
     return camera_list
 
-def camera_to_JSON(id, camera : Camera):
+
+def camera_to_JSON(id, camera: Camera):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
@@ -129,13 +100,13 @@ def camera_to_JSON(id, camera : Camera):
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
     camera_entry = {
-        'id' : id,
-        'img_name' : camera.image_name,
-        'width' : camera.width,
-        'height' : camera.height,
+        'id': id,
+        'img_name': camera.image_name,
+        'width': camera.width,
+        'height': camera.height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy': fov2focal(camera.FovY, camera.height),
+        'fx': fov2focal(camera.FovX, camera.width),
     }
     return camera_entry
