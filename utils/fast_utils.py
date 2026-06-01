@@ -1,0 +1,104 @@
+import random
+import torch
+import torch.nn.functional as F
+from gaussian_renderer import render
+
+
+def _sample_cameras(viewpoint_stack, num_cams):
+    """从 viewpoint_stack 中随机采样 num_cams 个相机（不放回）"""
+    num_cams = min(num_cams, len(viewpoint_stack))
+    indices = random.sample(range(len(viewpoint_stack)), num_cams)
+    return [viewpoint_stack[i] for i in indices]
+
+
+def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DENSIFY=False):
+    """计算每个高斯的多视角重建质量分数，用于指导 densification 和 pruning。
+
+    对 opt.fastgs_num_cams 个随机相机视角渲染场景：
+    - 先渲染得到图像，计算像素级 L1 误差并归一化，标出高误差像素 metric_map
+    - 再用 metric_map 渲染，让 CUDA 统计每个高斯覆盖了多少个高误差像素（accum_counts）
+    - 同时记录当前视角的光度误差 E_photo = L1 + SSIM 混合损失
+
+    两个分数分别计算，物理含义不同：
+      importance_score = floor(Σ accum_counts / |cams|)
+        → 纯计数，平均有多少视角认为该高斯重建差，用于 densification 门控
+      pruning_score = normalize(Σ E_photo × accum_counts)
+        → E_photo 加权计数，重建误差大的视角权重更高，用于 pruning 采样权重
+
+    Args:
+        viewpoint_stack: 训练相机列表
+        gaussians: GaussianModel
+        pipe: 渲染 pipeline 参数
+        bg: 背景颜色 tensor
+        opt: OptimizationParams，使用 fastgs_num_cams / fastgs_loss_thresh 字段
+        DENSIFY (bool): True 时才计算 importance_score（split/clone 路径需要），
+                        False 时只计算 pruning_score（final prune 路径）
+
+    Returns:
+        importance_score (Tensor | None): [N] per-Gaussian 整数计数，DENSIFY=False 时为 None
+        pruning_score (Tensor): [N] 归一化到 [0,1] 的 E_photo 加权分数
+    """
+    camlist = _sample_cameras(viewpoint_stack, opt.fastgs_num_cams)
+
+    full_metric_counts = None   # Σ accum_counts（纯计数，给 importance_score 用）
+    full_metric_score = None    # Σ E_photo × accum_counts（加权，给 pruning_score 用）
+
+    with torch.no_grad():
+        for cam in camlist:
+            # ── 第一次渲染：得到图像，计算高误差像素位置 ──────────────────────
+            pkg = render(cam, gaussians, pipe, bg)
+            rendered = pkg['final_rendering']
+            gt = cam.original_image.cuda()
+
+            # 像素级 L1，归一化到 [0,1]
+            l1_per_pixel = torch.mean(torch.abs(rendered - gt), dim=0)  # [H, W]
+            l1_min, l1_max = l1_per_pixel.min(), l1_per_pixel.max()
+            if l1_max - l1_min < 1e-6:
+                continue
+            l1_norm = (l1_per_pixel - l1_min) / (l1_max - l1_min)
+
+            # E_photo：视角级光度损失（L1 + SSIM 混合），作为 pruning_score 的权重
+            Ll1 = torch.mean(torch.abs(rendered - gt))
+            ssim_val = 1.0 - F.mse_loss(rendered, gt)      # 近似 SSIM，计算廉价
+            e_photo = (1.0 - 0.2) * Ll1 + 0.2 * (1.0 - ssim_val)
+
+            # 高误差像素标记 [H*W]，int32，供 CUDA atomicAdd 使用
+            metric_map = (l1_norm > opt.fastgs_loss_thresh).int().flatten()
+
+            # ── 第二次渲染：传入 metric_map，CUDA 统计 per-Gaussian 计数 ────────
+            pkg2 = render(cam, gaussians, pipe, bg, metric_map=metric_map)
+            accum_counts = pkg2['accum_metric_counts']  # [N]，int32
+
+            # ── 累积 importance_score（纯计数） ───────────────────────────────
+            if DENSIFY:
+                if full_metric_counts is None:
+                    full_metric_counts = accum_counts.clone().float()
+                else:
+                    full_metric_counts += accum_counts.float()
+
+            # ── 累积 pruning_score（E_photo 加权） ────────────────────────────
+            weighted = e_photo.item() * accum_counts.float()
+            if full_metric_score is None:
+                full_metric_score = weighted
+            else:
+                full_metric_score += weighted
+
+    if full_metric_score is None:
+        # 所有视角误差太小，退化为全零分数
+        N = gaussians.get_xyz.shape[0]
+        return (torch.zeros(N, device='cuda') if DENSIFY else None), torch.zeros(N, device='cuda')
+
+    # pruning_score：E_photo 加权，归一化到 [0,1]
+    s_min, s_max = full_metric_score.min(), full_metric_score.max()
+    if s_max - s_min < 1e-6:
+        pruning_score = torch.zeros_like(full_metric_score)
+    else:
+        pruning_score = (full_metric_score - s_min) / (s_max - s_min)
+
+    # importance_score：纯计数，按视角数取整均值
+    if DENSIFY:
+        importance_score = torch.div(full_metric_counts, len(camlist), rounding_mode='floor')
+    else:
+        importance_score = None
+
+    return importance_score, pruning_score

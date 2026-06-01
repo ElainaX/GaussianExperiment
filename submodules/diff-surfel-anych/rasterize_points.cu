@@ -37,7 +37,8 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 }
 
 template<int NUM_CHANNELS>
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// [FASTGS] 返回值扩展为 9-tuple，末位新增 accum_metric_counts
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -49,7 +50,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& transMat_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
 	const int image_height,
 	const int image_width,
@@ -57,7 +58,11 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug)
+	const bool debug,
+	// [FASTGS BEGIN] 可选输入：高误差像素标记 [H*W]，空 Tensor 表示不启用计数
+	const torch::Tensor& metric_map
+	// [FASTGS END]
+	)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -94,6 +99,9 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_extra = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+  // [FASTGS BEGIN] 分配 per-Gaussian 计数 tensor，初始化为 0
+  torch::Tensor accum_metric_counts = torch::zeros({P}, int_opts);
+  // [FASTGS END]
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -113,6 +121,12 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
 	  }
 
+	  // [FASTGS BEGIN] 解析 metric_map：空 Tensor 时传 nullptr，否则传 data_ptr
+	  const int* metric_map_ptr = (metric_map.defined() && metric_map.numel() > 0)
+	      ? metric_map.contiguous().data_ptr<int>()
+	      : nullptr;
+	  // [FASTGS END]
+
 	  rendered = CudaRasterizer::Rasterizer::forward<NUM_CHANNELS>(
 		geomFunc,
 		binningFunc,
@@ -123,12 +137,12 @@ RasterizeGaussiansCUDA(
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
 		extras.contiguous().data_ptr<float>(),
-		opacity.contiguous().data<float>(), 
+		opacity.contiguous().data<float>(),
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
-		transMat_precomp.contiguous().data<float>(), 
-		viewmatrix.contiguous().data<float>(), 
+		transMat_precomp.contiguous().data<float>(),
+		viewmatrix.contiguous().data<float>(),
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		tan_fovx,
@@ -138,10 +152,16 @@ RasterizeGaussiansCUDA(
 		out_extra.contiguous().data_ptr<float>(),
 		out_others.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
-		debug);
+		debug,
+		// [FASTGS BEGIN]
+		metric_map_ptr,
+		accum_metric_counts.contiguous().data_ptr<int>()
+		// [FASTGS END]
+		);
 
   }
-  return std::make_tuple(rendered, out_color, out_extra, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
+  // [FASTGS] 返回值末位追加 accum_metric_counts
+  return std::make_tuple(rendered, out_color, out_extra, out_others, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts);
 }
 
 template<int NUM_CHANNELS>
@@ -271,7 +291,7 @@ torch::Tensor markVisible(
 
 
 #define X(N) \
-	template std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
+	template std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
 	RasterizeGaussiansCUDA<N>( \
 		const torch::Tensor& background, \
 		const torch::Tensor& means3D, \
@@ -291,7 +311,8 @@ torch::Tensor markVisible(
 		const int degree, \
 		const torch::Tensor& campos, \
 		const bool prefiltered, \
-		const bool debug); \
+		const bool debug, \
+		const torch::Tensor& metric_map); \
 	template std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
 	RasterizeGaussiansBackwardCUDA<N>( \
 		const torch::Tensor& background, \

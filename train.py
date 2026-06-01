@@ -22,6 +22,7 @@ from tqdm import tqdm
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import *
 from scene import GaussianModel, Scene
+from utils.fast_utils import compute_gaussian_score_rtsplat  # [FASTGS]
 from utils.general_utils import safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
@@ -35,92 +36,130 @@ except ImportError:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+
+    # =========================================================================
+    # 阶段①：初始化
+    # =========================================================================
     first_iter = 0
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
+
+    # 创建高斯模型（包含位置/颜色/不透明度/协方差等所有可学习参数）
     gaussians = GaussianModel(dataset.sh_degree, dataset)
 
+    # 加载场景：读取相机位姿 + 初始点云（来自 COLMAP 或合成数据集）
     scene = Scene(dataset, gaussians, resolution_scales=[1.0])
 
+    # 给高斯模型设置 Adam 优化器，每个属性（xyz/色彩/不透明度等）有独立学习率
     gaussians.training_setup(opt)
 
+    # 如果指定了 checkpoint，从中恢复模型参数和迭代起点
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # 背景颜色：白色或黑色，影响渲染时的背景填充
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
 
+    # CUDA Event 用于精确测量每次迭代的 GPU 耗时
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
-    ###########################################################################
+    # =========================================================================
+    # 阶段②：训练前准备
+    # =========================================================================
+    # 拷贝训练相机列表，每次迭代随机从中取一个视角
     viewpoint_stack = scene.getTrainCameras(scale=1.0).copy()
     print('Training set length', len(viewpoint_stack))
 
-    ema_loss_dict = {}
+    ema_loss_dict = {}  # 指数移动平均 loss，用于进度条显示
     progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
     first_iter += 1
-    last_reset_iter = -100000
-    pipe.init_stage = True
+    last_reset_iter = -100000  # 记录上次 reset occupancy 的迭代，用于 prune 阈值判断
+    pipe.init_stage = True     # init_stage=True 时渲染管线走简化路径（不含完整 PBR 分解）
 
+    # =========================================================================
+    # 阶段③：主训练循环
+    # =========================================================================
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
 
+        # 按迭代数衰减各属性的学习率（位置学习率按指数衰减，其他固定）
         gaussians.update_learning_rate(iteration)
 
+        # 每 1000 次迭代提升球谐函数阶数上限（从低频到高频逐步激活颜色细节）
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
+        # ------------------------------------------------------------------
+        # 取一个随机训练视角及其 GT 图像
+        # ------------------------------------------------------------------
         data_idx = np.random.randint(len(viewpoint_stack))
-
         viewpoint_cam = viewpoint_stack[data_idx]
         gt_image = viewpoint_cam.original_image.cuda()
-        gt_transparent_mask = viewpoint_cam.gt_transparent_mask.cuda()
+        gt_transparent_mask = viewpoint_cam.gt_transparent_mask.cuda()  # True=透明区域
 
+        # 若 GT 有 alpha 通道（RGBA），用随机背景色合成，增强对透明区域的泛化
         if gt_image.shape[0] == 4:
             bg = torch.rand((3), device='cuda')
             gt_image = gt_image[:3, ...] * gt_image[3:, ...] + (1 - gt_image[3:, ...]) * bg[:, None, None]
         else:
             bg = torch.zeros((3), device='cuda')
 
+        # ------------------------------------------------------------------
+        # 前向渲染：输出完整的渲染分量（这是本项目与标准 3DGS 最大的不同）
+        # ------------------------------------------------------------------
         if iteration >= opt.init_until_iter:
-            pipe.init_stage = False
+            pipe.init_stage = False  # 超过初始化阶段后切换到完整 PBR 渲染路径
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
 
+        # 用于 densification 的梯度信号：哪些高斯可见、它们的屏幕空间半径
         viewspace_point_tensor = render_pkg['viewspace_points']
         visibility_filter = render_pkg['visibility_filter']
         radii = render_pkg['radii']
 
+        # 最终合成图像 = scatter 分量 + transmitted 分量 + specular 分量
         final_rendering = render_pkg['final_rendering']
-        final_tran = render_pkg['final_tran']
-        final_scat = render_pkg['final_scat']
-        final_spec = render_pkg['final_spec']
-        render_tran = render_pkg['render_tran']
-        render_scat = render_pkg['render_scat']
-        transmissivity = render_pkg['transmissivity']
-        foreground = render_pkg['foreground']
+        final_tran = render_pkg['final_tran']    # 透射：穿过透明物体的背景光
+        final_scat = render_pkg['final_scat']    # 散射：物体内部次表面散射的漫反射
+        final_spec = render_pkg['final_spec']    # 镜面：菲涅耳反射的高光
+        render_tran = render_pkg['render_tran']  # 不含 PBR 分解的原始透射渲染（init 阶段用）
+        render_scat = render_pkg['render_scat']  # 不含 PBR 分解的原始散射渲染
+        transmissivity = render_pkg['transmissivity']  # 每像素的透明度（标量图）
+        foreground = render_pkg['foreground']          # 前景 mask（有高斯覆盖的区域）
 
+        # 法线相关：surface_normal 来自高斯朝向，surface_depth_normal 来自深度梯度
         surface_normal = render_pkg['surface_normal']
         surface_depth_normal = render_pkg['surface_depth_normal']
-        surface_opacity = render_pkg['surface_opacity']
+        surface_opacity = render_pkg['surface_opacity']  # 不透明物体的 alpha 图
 
-        volume_dist = render_pkg['volume_dist']
+        volume_dist = render_pkg['volume_dist']  # 体积内高斯沿射线的分散程度（用于正则化）
 
+        # ------------------------------------------------------------------
+        # 计算 Loss（课程式：不同迭代阶段开启不同 loss 组合）
+        # ------------------------------------------------------------------
         loss = 0.0
         loss_dict = {}
 
+        # === 阶段 A：早期 init（< norm_loss_from_iter）只用原始透射图对 GT 做监督 ===
+        # 此时网络还没稳定，用简单的 render_tran 而非完整 PBR 合成图
         if iteration < opt.norm_loss_from_iter:
             loss_diff = (1.0 - opt.lambda_dssim) * l1_loss(render_tran, gt_image) + opt.lambda_dssim * (1.0 - ssim(render_tran, gt_image))
             loss += loss_diff
             loss_dict['diff'] = loss_diff.item()
+        # === 阶段 B：中期 init（norm_loss_from_iter ~ init_until_iter）用完整合成图但不用 PBR 分解 ===
         elif iteration < opt.init_until_iter:
             loss_diff = (1.0 - opt.lambda_dssim) * l1_loss(final_rendering, gt_image) + opt.lambda_dssim * (1.0 - ssim(final_rendering, gt_image))
             loss += loss_diff
             loss_dict['diff'] = loss_diff.item()
+        # === 阶段 C：完整 PBR 阶段（>= init_until_iter）===
         else:
             if iteration < opt.mask_loss_from_iter:
+                # mask loss 还没开启，直接用合成图
                 detached_rendering = final_rendering
             else:
+                # 镜面反射区域（spec_complexity 高的地方）用 detach 过的 tran，
+                # 防止高光区域的梯度干扰透射分量的学习
                 spec_variance = local_variance(final_spec, weights=1 - surface_opacity.detach())
                 spec_complexity = 1 - torch.exp(-opt.local_var_scale * spec_variance.detach())
                 detached_tran = final_tran.detach() * spec_complexity + final_tran * (1 - spec_complexity)
@@ -131,28 +170,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += loss_pbr
             loss_dict['pbr'] = loss_pbr.item()
 
+            # LPIPS 感知损失（可选），在 lpips_loss_from_iter 后开启
             if opt.lambda_lpips > 0 and iteration >= opt.lpips_loss_from_iter:
                 loss_lpips = opt.lambda_lpips * lpips(detached_rendering, gt_image)
                 loss += loss_lpips
                 loss_dict['lpips'] = loss_lpips.item()
 
+        # === Occupancy 衰减 loss：惩罚可见高斯的不透明度，鼓励稀疏表示 ===
         if opt.occupancy_decay_weight > 0 and iteration >= opt.init_until_iter:
             occupancy_loss = opt.occupancy_decay_weight * (gaussians.get_occupancy[visibility_filter]).mean()
             loss += occupancy_loss
             loss_dict['occupancy'] = occupancy_loss.item()
 
+        # === 法线一致性 loss：surface_normal（高斯朝向）与 surface_depth_normal（深度梯度法线）对齐 ===
+        # 让高斯的朝向与几何表面对齐，改善法线质量
         if iteration >= opt.norm_loss_from_iter and opt.norm_loss_weight > 0:
             error = 1 - (surface_normal * surface_depth_normal).sum(dim=0, keepdim=True)
-            error = error * foreground
+            error = error * foreground  # 只在有几何的区域算
             norm_loss = opt.norm_loss_weight * error.mean()
             loss += norm_loss
             loss_dict['norm'] = norm_loss.item()
 
+        # === 体积分散 loss：惩罚同一射线上的高斯过于分散，鼓励高斯贴合表面 ===
         if iteration >= opt.dist_loss_from_iter and opt.dist_loss_weight > 0:
             dist_loss = opt.dist_loss_weight * volume_dist.mean()
             loss += dist_loss
             loss_dict['dist'] = dist_loss.item()
 
+        # === Mask loss：监督不透明度与 GT 透明 mask 的一致性（BCE） ===
         if opt.mask_loss_from_iter == -1:
             opt.mask_loss_from_iter = opt.init_until_iter
         if opt.mask_loss_weight > 0 and iteration >= opt.mask_loss_from_iter:
@@ -160,11 +205,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += mask_loss
             loss_dict['mask'] = mask_loss.item()
 
+        # === Transmissivity loss：不透明区域的透明度应接近 0（BCE 强制为二值） ===
         if iteration >= opt.init_until_iter:
             transmissivity_loss = opt.transmissivity_loss_weight * binary_cross_entropy(transmissivity[~gt_transparent_mask], 0)
             loss += transmissivity_loss
             loss_dict['transmissivity'] = transmissivity_loss.item()
 
+        # === Consistency loss：透明区域内的 transmissivity 和 scatter 应当均匀，减少噪声 ===
         if opt.consistency_loss_weight > 0 and iteration >= opt.init_until_iter:
             consistency_loss = 0
             tran_vals = transmissivity[gt_transparent_mask]
@@ -178,12 +225,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += consistency_loss
             loss_dict['consistency'] = consistency_loss.item()
 
+        # ------------------------------------------------------------------
+        # 反向传播
+        # ------------------------------------------------------------------
         total_loss = loss
         total_loss.backward()
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
+            # 用 EMA 平滑各 loss，显示在进度条上
             for key, value in loss_dict.items():
                 ema_loss_dict[key] = 0.4 * value + 0.6 * ema_loss_dict.get(key, 0.0)
 
@@ -201,23 +251,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print('\n[ITER {}] Saving Gaussians'.format(iteration))
                 scene.save(iteration)
 
-            # Densification
+            # =========================================================
+            # 阶段④：Densification（高斯的自适应增删）
+            # =========================================================
+            # densify_until_iter 之前持续对高斯数量进行自适应调整
             if iteration < opt.densify_until_iter:
+                # 记录每个高斯在屏幕上的最大半径（用于判断是否需要分裂）
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # 累积梯度统计，用于判断哪些高斯需要分裂（梯度大=重建不足）或克隆
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, iteration)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    # size_threshold：超过 occupancy_reset_interval 后才剔除屏幕过大的高斯
                     size_threshold = 20 if iteration > opt.occupancy_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.occupancy_cull, scene.cameras_extent, size_threshold, last_reset_iter)
+                    # [FASTGS BEGIN] 多视角一致性引导的 densification + pruning
+                    # 采样一批视角，计算两个分数：
+                    #   importance_score：纯计数，门控 clone/split
+                    #   pruning_score：E_photo 加权计数，控制 prune 采样权重
+                    importance_score, pruning_score = compute_gaussian_score_rtsplat(
+                        scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=True
+                    )
+                    gaussians.densify_and_prune_fastgs(
+                        opt, importance_score, pruning_score,
+                        scene.cameras_extent, size_threshold, last_reset_iter
+                    )
+                    # [FASTGS END]
 
+                # 定期将所有高斯的 occupancy（不透明度）重置为低值，
+                # 让无用高斯在下一轮被 prune 淘汰
                 if iteration % opt.occupancy_reset_interval == 0:
                     gaussians.reset_occupancy()
                     last_reset_iter = iteration
 
+                # 在 reset_occupancy 的中间点 reset opacity（标准 3DGS 的做法，与 occupancy 机制配合）
                 if iteration >= opt.occupancy_reset_interval and iteration % opt.occupancy_reset_interval == opt.occupancy_reset_interval // 2:
                     gaussians.reset_opacity()
 
-            # Optimizer step
+            # =========================================================
+            # 阶段⑤：参数更新
+            # =========================================================
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)

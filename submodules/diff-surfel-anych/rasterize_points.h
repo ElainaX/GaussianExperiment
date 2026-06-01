@@ -16,7 +16,8 @@
 #include <string>
 	
 template<int NUM_CHANNELS>
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// [FASTGS] 返回值从 8-tuple 扩展为 9-tuple，新增 accum_metric_counts
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -28,7 +29,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& transMat_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
 	const int image_height,
 	const int image_width,
@@ -36,7 +37,11 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug);
+	const bool debug,
+	// [FASTGS BEGIN] 可选输入：高误差像素标记 [H*W]，空 Tensor 表示不启用计数
+	const torch::Tensor& metric_map = torch::Tensor()
+	// [FASTGS END]
+	);
 
 template<int NUM_CHANNELS>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

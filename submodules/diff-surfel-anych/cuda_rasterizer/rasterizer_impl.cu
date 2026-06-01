@@ -220,7 +220,12 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_extra,
 	float* out_others,
 	int* radii,
-	bool debug)
+	bool debug,
+	// [FASTGS BEGIN]
+	const int* metric_map,
+	int* accum_metric_counts
+	// [FASTGS END]
+	)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -335,7 +340,12 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		out_extra,
-		out_others), debug)
+		out_others,
+		// [FASTGS BEGIN]
+		metric_map,
+		accum_metric_counts
+		// [FASTGS END]
+		), debug)
 
 	return num_rendered;
 }

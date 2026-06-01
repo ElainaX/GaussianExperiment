@@ -128,6 +128,15 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
 
+        # [FASTGS BEGIN] 多视角一致性 densification 参数
+        self.fastgs_grad_thresh = 0.0002      # clone 判断：位置梯度阈值
+        self.fastgs_grad_abs_thresh = 0.0002  # split 判断：尺寸梯度（scaling.grad）阈值
+        self.fastgs_dense = 0.01              # 尺寸阈值因子（对应 percent_dense）
+        self.fastgs_loss_thresh = 0.5         # metric_map：L1 归一化误差高于此值标记为高误差像素
+        self.fastgs_min_importance = 5        # 多视角投票门控：至少被这么多视角认为重建差才参与增殖
+        self.fastgs_num_cams = 10             # 每次 score 计算采样的相机数量
+        # [FASTGS END]
+
         self.gsrgb_loss = False
         self.init_until_iter = 0
         self.alpha_until_iter = -1

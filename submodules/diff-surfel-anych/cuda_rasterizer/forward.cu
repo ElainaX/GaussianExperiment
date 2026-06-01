@@ -275,7 +275,12 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_extra,
-	float* __restrict__ out_others)
+	float* __restrict__ out_others,
+	// [FASTGS BEGIN] 多视角重建质量计数所需新增参数
+	const int* __restrict__ metric_map,  // 输入：[H*W] 高误差像素标记，nullptr 表示跳过
+	int* accum_metric_counts             // 输出：[N] per-Gaussian 被高误差视角覆盖的累积次数
+	// [FASTGS END]
+	)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -401,6 +406,13 @@ renderCUDA(
 			}
 
 			float w = alpha * T;
+
+			// [FASTGS BEGIN] 若当前像素被标记为高误差，则对覆盖该像素的高斯计数 +1
+			if (metric_map != nullptr && metric_map[pix_id]) {
+				atomicAdd(&accum_metric_counts[collected_id[j]], 1);
+			}
+			// [FASTGS END]
+
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -476,7 +488,12 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* out_extra,
-	float* out_others)
+	float* out_others,
+	// [FASTGS BEGIN]
+	const int* metric_map,
+	int* accum_metric_counts
+	// [FASTGS END]
+	)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -494,7 +511,12 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_extra,
-		out_others);
+		out_others,
+		// [FASTGS BEGIN]
+		metric_map,
+		accum_metric_counts
+		// [FASTGS END]
+		);
 }
 
 template<int NUM_CHANNELS>
@@ -569,7 +591,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		const float* bg_color, \
 		float* out_color, \
 		float* out_extra, \
-		float* out_others); \
+		float* out_others, \
+		const int* metric_map, \
+		int* accum_metric_counts); \
 	template void FORWARD::preprocess<N>( \
 		int P, int D, int M, \
 		const float* means3D, \

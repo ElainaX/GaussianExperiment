@@ -53,7 +53,12 @@ namespace CudaRasterizer
 			float* out_extra,
 			float* out_others,
 			int* radii = nullptr,
-			bool debug = false);
+			bool debug = false,
+			// [FASTGS BEGIN] 多视角重建质量计数，默认 nullptr 表示不启用
+			const int* metric_map = nullptr,
+			int* accum_metric_counts = nullptr
+			// [FASTGS END]
+			);
 
 		template<int NUM_CHANNELS>
 		static void backward(

@@ -106,6 +106,7 @@ class GaussianModel:
         self._occupancy = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.xyz_gradient_accum_abs = torch.empty(0)  # [FASTGS] 尺寸梯度（scaling.grad）累积
         self.denom = torch.empty(0)
         self.last_update = torch.empty(0)
         self.optimizer = None
@@ -278,6 +279,7 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')  # [FASTGS]
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
         self.last_update = torch.zeros((self.get_xyz.shape[0], 1), device='cuda', dtype=torch.int)
 
@@ -536,6 +538,7 @@ class GaussianModel:
         self._language_feature = optimizable_tensors['feature']
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]  # [FASTGS]
 
         self.denom = self.denom[valid_points_mask]
         self.last_update = self.last_update[valid_points_mask]
@@ -598,6 +601,7 @@ class GaussianModel:
         self._language_feature = optimizable_tensors['feature']
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')  # [FASTGS]
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device='cuda')
 
@@ -658,6 +662,121 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancies, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
 
+    # [FASTGS BEGIN] ──────────────────────────────────────────────────────────
+    # 多视角一致性引导的 densification/pruning 方法
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def densify_and_clone_fastgs(self, metric_mask, all_clones):
+        """克隆满足条件的高斯：尺寸小 + 位置梯度大 + 多视角认证重建差"""
+        selected_pts_mask = torch.logical_and(all_clones, metric_mask)
+        if selected_pts_mask.sum() == 0:
+            return
+
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_occupancies = self._occupancy[selected_pts_mask]
+        new_opacity = self._opacity[selected_pts_mask]
+        new_transmissivity = self._transmissivity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+        new_reflectance = self._reflectance[selected_pts_mask]
+        new_roughness = self._roughness[selected_pts_mask]
+        new_language_feature = self._language_feature[selected_pts_mask]
+
+        self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask]), dim=0)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancies, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+    def densify_and_split_fastgs(self, metric_mask, all_splits, N=2):
+        """分裂满足条件的高斯：尺寸大 + 尺寸梯度大 + 多视角认证重建差"""
+        n_init_points = self.get_xyz.shape[0]
+        selected_pts_mask = torch.logical_and(all_splits, metric_mask)
+        # 对齐维度（metric_mask 可能比 all_splits 短）
+        padded = torch.zeros(n_init_points, dtype=torch.bool, device='cuda')
+        padded[:selected_pts_mask.shape[0]] = selected_pts_mask
+        selected_pts_mask = padded
+
+        if selected_pts_mask.sum() == 0:
+            return
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        stds = torch.cat([stds, torch.zeros_like(stds[:, :1])], dim=-1)
+        means = torch.zeros_like(stds)
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_occupancy = self._occupancy[selected_pts_mask].repeat(N, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_transmissivity = self._transmissivity[selected_pts_mask].repeat(N, 1)
+        new_reflectance = self._reflectance[selected_pts_mask].repeat(N, 1)
+        new_roughness = self._roughness[selected_pts_mask].repeat(N, 1)
+        new_language_feature = self._language_feature[selected_pts_mask].repeat(N, 1)
+
+        self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask].repeat(N, 1)), dim=0)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancy, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, extent, max_screen_size, last_reset_iter):
+        """FastGS 风格的 densification + pruning：
+        - clone：位置梯度大 + 尺寸小 + 多视角投票通过
+        - split：尺寸梯度大 + 尺寸大 + 多视角投票通过
+        - prune：低 occupancy + 多视角加权采样（预算控制，不一次全删）
+        """
+        grad_vars = self.xyz_gradient_accum / self.denom
+        grad_vars[grad_vars.isnan()] = 0.0
+
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
+        grads_abs[grads_abs.isnan()] = 0.0
+
+        # 位置梯度判断 clone；尺寸梯度判断 split
+        grad_qualifiers = torch.norm(grad_vars, dim=-1) >= opt.fastgs_grad_thresh
+        grad_qualifiers_abs = torch.norm(grads_abs, dim=-1) >= opt.fastgs_grad_abs_thresh
+
+        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= opt.fastgs_dense * extent
+        split_qualifiers = torch.max(self.get_scaling, dim=1).values > opt.fastgs_dense * extent
+
+        all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
+        all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
+
+        # 多视角投票门控：至少被 fastgs_min_importance 个视角认定为重建差
+        metric_mask = importance_score > opt.fastgs_min_importance
+
+        self.densify_and_clone_fastgs(metric_mask, all_clones)
+        self.densify_and_split_fastgs(metric_mask, all_splits)
+
+        # Prune：低 occupancy / 屏幕过大 / 世界空间过大
+        prune_mask = (self.get_occupancy < opt.occupancy_cull).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        prune_mask = torch.logical_and(prune_mask, self.last_update.squeeze() > last_reset_iter)
+
+        # 预算控制：每次只删一半候选，按 pruning_score 加权采样（优先删多视角误差大的）
+        to_remove = torch.sum(prune_mask).item()
+        remove_budget = int(0.5 * to_remove)
+        if remove_budget > 0:
+            n_pts = self.get_xyz.shape[0]
+            padded_score = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
+            score_len = min(pruning_score.shape[0], n_pts)
+            # score 越高越应该删，所以用 1/(1e-6 + (1-score)) 作为采样权重
+            padded_score[:score_len] = 1.0 / (1e-6 + 1.0 - pruning_score[:score_len].squeeze())
+            selected_pts_mask = torch.zeros(n_pts, dtype=torch.bool, device='cuda')
+            sampled_indices = torch.multinomial(padded_score, remove_budget, replacement=False)
+            selected_pts_mask[sampled_indices] = True
+            final_prune = torch.logical_and(prune_mask, selected_pts_mask)
+            self.prune_points(final_prune)
+
+        torch.cuda.empty_cache()
+
+    # [FASTGS END] ────────────────────────────────────────────────────────────
+
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -677,5 +796,9 @@ class GaussianModel:
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, iteration):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+        # [FASTGS BEGIN] 用 scaling 参数梯度作为尺寸压力信号（split 判断依据）
+        if self._scaling.grad is not None:
+            self.xyz_gradient_accum_abs[update_filter] += torch.norm(self._scaling.grad[update_filter], dim=-1, keepdim=True)
+        # [FASTGS END]
         self.denom[update_filter] += 1
         self.last_update[update_filter] = iteration

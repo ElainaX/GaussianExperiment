@@ -68,7 +68,12 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* out_extra,
-		float* out_others);
+		float* out_others,
+		// [FASTGS BEGIN] 多视角重建质量计数所需新增参数
+		const int* metric_map,       // 输入：[H*W] 高误差像素标记，nullptr 表示不计数
+		int* accum_metric_counts     // 输出：[N] per-Gaussian 被高误差视角覆盖的累积次数
+		// [FASTGS END]
+		);
 
 }
 
