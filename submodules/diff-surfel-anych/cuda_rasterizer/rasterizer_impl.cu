@@ -488,7 +488,9 @@ void CudaRasterizer::Rasterizer::backward(
 		float* out_extra, \
 		float* out_others, \
 		int* radii, \
-		bool debug); \
+		bool debug, \
+		const int* metric_map, \
+		int* accum_metric_counts); \
 	template void CudaRasterizer::Rasterizer::backward<N>( \
 		const int P, int D, int M, int R, \
 		const float* background, \

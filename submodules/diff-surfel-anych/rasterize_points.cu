@@ -24,8 +24,7 @@
 #include <string>
 #include <functional>
 
-#define CHECK_INPUT(x)											\
-	AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_INPUT(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 	// AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
 
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
