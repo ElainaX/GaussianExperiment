@@ -23,7 +23,7 @@ from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import *
 from scene import GaussianModel, Scene
 from utils.fast_utils import compute_gaussian_score_rtsplat  # [FASTGS]
-from utils.general_utils import safe_state
+from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
 
@@ -64,6 +64,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # CUDA Event 用于精确测量每次迭代的 GPU 耗时
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
+
+    # 训练指标追踪器：每 100 iter 记录高斯数量和显存压力，自动写 JSON（崩溃安全）
+    tracker = GaussianTracker(scene.model_path, interval=100)
 
     # =========================================================================
     # 阶段②：训练前准备
@@ -297,6 +300,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + '/chkpnt' + str(iteration) + '.pth')
+
+            tracker.record(iteration, gaussians)
+
+    tracker.draw()
     if tb_executor is not None:
         tb_executor.shutdown()
 

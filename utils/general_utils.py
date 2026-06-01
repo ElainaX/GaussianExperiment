@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
+import os
 import random
 import sys
 from datetime import datetime
@@ -166,6 +168,103 @@ def create_rotation_matrix_from_direction_vector_batch(direction_vectors):
 #     rotations = create_rotation_matrix_from_direction_vector_batch(normals)
 #     rotations = conversions.rotation_matrix_to_quaternion(rotations,eps=1e-5, order=conversions.QuaternionCoeffOrder.WXYZ)
 #     return rotations
+
+
+class GaussianTracker:
+    """训练过程中定期采样指标，支持训练结束后绘图，也支持边训练边绘图。
+
+    接口：
+        tracker = GaussianTracker(model_path, interval=100)
+        tracker.record(iteration, gaussians)   # 主循环里每 iter 调用一次，内部按 interval 过滤
+        tracker.draw()                          # 训练结束后调用，保存折线图到 model_path
+
+    记录的指标：
+        - 有效高斯数量
+        - GPU 显存已分配（实际用量）
+        - GPU 显存已预留（PyTorch 向驱动申请的总块，是显存压力的真实指标）
+
+    崩溃安全：每次 record 后立即将数据序列化到 model_path/training_stats.json，
+    训练中途崩溃后数据不丢失，可用 draw_from_json(json_path) 单独复原图表。
+
+    边训练边绘图：
+        训练进程本身不弹窗（无 display 服务器时弹窗会卡死），而是每次 record 后
+        写 JSON。在另一个终端运行：
+            python utils/watch_training.py <model_path>
+        该脚本会每 10 秒读一次 JSON 并刷新 matplotlib 实时窗口。
+    """
+
+    def __init__(self, model_path: str, interval: int = 100):
+        self.interval = interval
+        self.json_path = os.path.join(model_path, 'training_stats.json')
+        self.iters: list[int] = []
+        self.n_gaussians: list[int] = []
+        self.vram_alloc_mb: list[float] = []
+        self.vram_reserved_mb: list[float] = []
+
+    def record(self, iteration: int, gaussians) -> None:
+        if iteration % self.interval != 0:
+            return
+
+        self.iters.append(iteration)
+        self.n_gaussians.append(gaussians.get_xyz.shape[0])
+        self.vram_alloc_mb.append(round(torch.cuda.memory_allocated() / 1024 ** 2, 1))
+        self.vram_reserved_mb.append(round(torch.cuda.memory_reserved() / 1024 ** 2, 1))
+
+        # 崩溃安全：立即持久化
+        with open(self.json_path, 'w') as f:
+            json.dump({
+                'iters': self.iters,
+                'n_gaussians': self.n_gaussians,
+                'vram_alloc_mb': self.vram_alloc_mb,
+                'vram_reserved_mb': self.vram_reserved_mb,
+            }, f)
+
+    def draw(self) -> None:
+        if not self.iters:
+            return
+        _plot_stats(
+            self.iters, self.n_gaussians, self.vram_alloc_mb, self.vram_reserved_mb,
+            out_path=os.path.join(os.path.dirname(self.json_path), 'training_stats.png'),
+        )
+
+    @staticmethod
+    def draw_from_json(json_path: str) -> None:
+        """从 JSON 文件单独复原图表，供训练崩溃后补绘。"""
+        with open(json_path) as f:
+            d = json.load(f)
+        _plot_stats(
+            d['iters'], d['n_gaussians'], d['vram_alloc_mb'], d['vram_reserved_mb'],
+            out_path=json_path.replace('.json', '.png'),
+        )
+
+
+def _plot_stats(iters, n_gaussians, vram_alloc_mb, vram_reserved_mb, out_path: str) -> None:
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig.suptitle('Training Statistics', fontsize=13)
+
+    # ── 高斯数量 ──────────────────────────────────────────────────────────
+    ax1.plot(iters, n_gaussians, color='steelblue', linewidth=1.5)
+    ax1.set_ylabel('Active Gaussians')
+    ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
+    ax1.grid(True, alpha=0.3)
+    ax1.set_title('Gaussian Count')
+
+    # ── 显存 ──────────────────────────────────────────────────────────────
+    ax2.plot(iters, vram_alloc_mb,    label='Allocated (MB)', color='tomato',  linewidth=1.5)
+    ax2.plot(iters, vram_reserved_mb, label='Reserved (MB)',  color='orange',  linewidth=1.5, linestyle='--')
+    ax2.set_ylabel('VRAM (MB)')
+    ax2.set_xlabel('Iteration')
+    ax2.set_title('GPU Memory Pressure')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'[GaussianTracker] stats → {out_path}')
 
 
 def colormap(img, cmap='jet'):
