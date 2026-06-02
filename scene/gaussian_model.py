@@ -751,8 +751,19 @@ class GaussianModel:
             self.densify_and_split_fastgs(metric_mask, all_splits)
         else:
             # 标准梯度增殖（无多视角门控）
-            self.densify_and_clone(grad_vars, opt.densify_grad_threshold, extent)
-            self.densify_and_split(grad_vars, opt.densify_grad_threshold, extent)
+            # do_prune=True 时 importance_score 已经算出来了，用它限制增殖规模防止高斯暴增
+            if importance_score is not None:
+                metric_mask = importance_score > opt.fastgs_min_importance
+                grad_qualifiers = torch.norm(grad_vars, dim=-1) >= opt.densify_grad_threshold
+                clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= opt.percent_dense * extent
+                split_qualifiers = torch.max(self.get_scaling, dim=1).values > opt.percent_dense * extent
+                all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
+                all_splits = torch.logical_and(split_qualifiers, grad_qualifiers)
+                self.densify_and_clone_fastgs(metric_mask, all_clones)
+                self.densify_and_split_fastgs(metric_mask, all_splits)
+            else:
+                self.densify_and_clone(grad_vars, opt.densify_grad_threshold, extent)
+                self.densify_and_split(grad_vars, opt.densify_grad_threshold, extent)
 
         # Prune：低 occupancy / 屏幕过大 / 世界空间过大
         prune_mask = (self.get_occupancy < opt.occupancy_cull).squeeze()
