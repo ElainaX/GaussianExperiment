@@ -41,6 +41,28 @@ from utils.general_utils import safe_state
 # Heatmap computation
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _apply_scale(hmap, scale, gamma=0.4):
+    """
+    Non-linear stretch so low-count regions stay visible.
+
+    scale
+        'linear' – divide by max (default, low counts go dark)
+        'log'    – log(1+x) / log(1+max)  good general choice
+        'sqrt'   – sqrt(x) / sqrt(max)    moderate stretch
+        'gamma'  – x^gamma / max^gamma    tunable via --gamma
+    """
+    vmax = hmap.max()
+    if vmax <= 0:
+        return hmap
+    if scale == 'log':
+        return np.log1p(hmap) / np.log1p(vmax)
+    if scale == 'sqrt':
+        return np.sqrt(hmap) / np.sqrt(vmax)
+    if scale == 'gamma':
+        return (hmap / vmax) ** gamma
+    return hmap / vmax   # linear
+
+
 @torch.no_grad()
 def compute_heatmap(gaussians, cam, weight_mode='count'):
     """
@@ -50,7 +72,7 @@ def compute_heatmap(gaussians, cam, weight_mode='count'):
         'count'   – each Gaussian contributes 1 per pixel it projects to
         'opacity' – each Gaussian contributes opacity × occupancy
 
-    Returns a float32 numpy array with values normalised to [0, 1].
+    Returns a raw float32 numpy array (not yet scaled).
     """
     H = cam.image_height
     W = cam.image_width
@@ -86,10 +108,7 @@ def compute_heatmap(gaussians, cam, weight_mode='count'):
     flat_idx = (py_v * W + px_v).clamp(0, H * W - 1)
     hmap = torch.zeros(H * W, device=xyz.device, dtype=torch.float32)
     hmap.scatter_add_(0, flat_idx, weights)
-    hmap = hmap.view(H, W).cpu().numpy()
-
-    vmax = hmap.max()
-    return (hmap / vmax) if vmax > 0 else hmap
+    return hmap.view(H, W).cpu().numpy()   # raw counts, scaling applied later
 
 
 def blur_heatmap(hmap, sigma):
@@ -170,6 +189,11 @@ if __name__ == '__main__':
                         help='Render scene and blend heatmap over it')
     parser.add_argument('--sigma', type=float, default=0.0,
                         help='Gaussian blur radius applied to heatmap (0 = none)')
+    parser.add_argument('--scale', default='log',
+                        choices=['linear', 'log', 'sqrt', 'gamma'],
+                        help='Intensity scale: log (default) keeps low counts visible')
+    parser.add_argument('--gamma', type=float, default=0.4,
+                        help='Exponent for --scale gamma (default: 0.4)')
     parser.add_argument('--cmap', default='inferno',
                         help='Matplotlib colormap name (default: inferno)')
     parser.add_argument('--output', default='',
@@ -230,8 +254,9 @@ if __name__ == '__main__':
             print(f'  [{idx + 1}/{len(cameras)}] {name}  '
                   f'{cam.image_width}×{cam.image_height}')
 
-        # Build heatmap
+        # Build heatmap: raw counts → scale → optional blur → [0,1]
         hmap = compute_heatmap(gaussians, cam, weight_mode=args.weight)
+        hmap = _apply_scale(hmap, scale=args.scale, gamma=args.gamma)
         if args.sigma > 0:
             hmap = blur_heatmap(hmap, sigma=args.sigma)
 
@@ -248,8 +273,8 @@ if __name__ == '__main__':
 
         # Save
         out_path = os.path.join(out_dir, f'{tag}_{name}.png')
-        title = (f'{name}  |  N={n_gaussians:,}  '
-                 f'iter={scene.loaded_iter}  weight={args.weight}')
+        title = (f'{name}  |  N={n_gaussians:,}  iter={scene.loaded_iter}  '
+                 f'weight={args.weight}  scale={args.scale}')
         save_heatmap_image(
             hmap, out_path,
             rendered_np=rendered_np,
