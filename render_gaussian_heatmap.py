@@ -111,6 +111,47 @@ def compute_heatmap(gaussians, cam, weight_mode='count'):
     return hmap.view(H, W).cpu().numpy()   # raw counts, scaling applied later
 
 
+@torch.no_grad()
+def compute_heatmap_rendered(gaussians, cam, pipe, bg):
+    """
+    Uses the CUDA accum_metric_counts mechanism (all-ones metric_map) to count
+    how many pixels each Gaussian was actually blended into during rendering,
+    then projects those counts back to image space.
+
+    Compared to compute_heatmap:
+      - respects depth ordering and alpha occlusion
+      - accounts for screen-space Gaussian footprint (large Gaussians → higher count)
+      - invisible/occluded Gaussians contribute 0
+    """
+    H = cam.image_height
+    W = cam.image_width
+
+    # Mark every pixel as "high error" so the CUDA kernel counts all Gaussians
+    metric_map = torch.ones(H * W, dtype=torch.int32, device='cuda')
+    pkg = gs_render(cam, gaussians, pipe, bg, metric_map=metric_map)
+    accum = pkg['accum_metric_counts'].float()  # [N]  per-Gaussian pixel-coverage count
+
+    # Project Gaussian centres back to pixels, weighted by their coverage count
+    xyz = gaussians.get_xyz                                    # [N, 3]
+    N   = xyz.shape[0]
+    ones  = torch.ones(N, 1, device=xyz.device)
+    xyz_h = torch.cat([xyz, ones], dim=1)                     # [N, 4]
+    ndc_h = xyz_h @ cam.full_proj_transform
+    w_h   = ndc_h[:, 3:4].clamp(min=1e-6)
+    ndc   = ndc_h[:, :3] / w_h
+
+    cam_z = (xyz_h @ cam.world_view_transform)[:, 2]
+    px = ((ndc[:, 0] + 1.0) * 0.5 * W).long()
+    py = ((ndc[:, 1] + 1.0) * 0.5 * H).long()
+    valid = (cam_z > 0.01) & (px >= 0) & (px < W) & (py >= 0) & (py < H)
+
+    flat_idx = (py[valid] * W + px[valid]).clamp(0, H * W - 1)
+    hmap = torch.zeros(H * W, device=xyz.device, dtype=torch.float32)
+    hmap.scatter_add_(0, flat_idx, accum[valid])
+
+    return hmap.view(H, W).cpu().numpy()   # raw counts, scaling applied later
+
+
 def blur_heatmap(hmap, sigma):
     """Optional Gaussian blur to smooth sparse heatmaps."""
     from scipy.ndimage import gaussian_filter
@@ -183,8 +224,11 @@ if __name__ == '__main__':
                         help='Checkpoint iteration to load (-1 = latest)')
     parser.add_argument('--cameras', nargs='+', default=['test'],
                         help='"train", "test", or integer indices into the test set')
+    parser.add_argument('--mode', choices=['project', 'rendered'], default='project',
+                        help='"project": fast point-cloud projection; '
+                             '"rendered": uses CUDA accum_metric_counts (slower, more accurate)')
     parser.add_argument('--weight', choices=['count', 'opacity'], default='count',
-                        help='Per-Gaussian weight: "count" (uniform) or "opacity"')
+                        help='Per-Gaussian weight for --mode project: "count" or "opacity"')
     parser.add_argument('--overlay', action='store_true',
                         help='Render scene and blend heatmap over it')
     parser.add_argument('--sigma', type=float, default=0.0,
@@ -244,8 +288,8 @@ if __name__ == '__main__':
     n_gaussians = gaussians.get_xyz.shape[0]
     print(f'Model: {dataset.model_path}  iter={scene.loaded_iter}  '
           f'Gaussians={n_gaussians:,}')
-    print(f'Cameras: {len(cameras)}  weight={args.weight}  '
-          f'sigma={args.sigma}  output={out_dir}')
+    print(f'Cameras: {len(cameras)}  mode={args.mode}  '
+          f'scale={args.scale}  sigma={args.sigma}  output={out_dir}')
 
     # ── Process each camera ─────────────────────────────────────────────────
     for idx, cam in enumerate(cameras):
@@ -254,13 +298,17 @@ if __name__ == '__main__':
             print(f'  [{idx + 1}/{len(cameras)}] {name}  '
                   f'{cam.image_width}×{cam.image_height}')
 
-        # Build heatmap: raw counts → scale → optional blur → [0,1]
-        hmap = compute_heatmap(gaussians, cam, weight_mode=args.weight)
+        # Build heatmap: raw counts → scale → optional blur
+        if args.mode == 'rendered':
+            hmap = compute_heatmap_rendered(gaussians, cam, pipe, background)
+        else:
+            hmap = compute_heatmap(gaussians, cam, weight_mode=args.weight)
+
         hmap = _apply_scale(hmap, scale=args.scale, gamma=args.gamma)
         if args.sigma > 0:
             hmap = blur_heatmap(hmap, sigma=args.sigma)
 
-        # Optionally render the scene for overlay
+        # Optionally render the scene for overlay (always a clean render, no metric_map)
         rendered_np = None
         if args.overlay:
             with torch.no_grad():
@@ -273,8 +321,9 @@ if __name__ == '__main__':
 
         # Save
         out_path = os.path.join(out_dir, f'{tag}_{name}.png')
+        mode_tag = args.mode if args.mode == 'rendered' else f'project-{args.weight}'
         title = (f'{name}  |  N={n_gaussians:,}  iter={scene.loaded_iter}  '
-                 f'weight={args.weight}  scale={args.scale}')
+                 f'mode={mode_tag}  scale={args.scale}')
         save_heatmap_image(
             hmap, out_path,
             rendered_np=rendered_np,
