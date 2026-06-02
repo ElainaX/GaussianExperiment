@@ -129,6 +129,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
 
         # [FASTGS BEGIN] 多视角一致性 densification 参数
+        self.fastgs_on = False                # 总开关：False=原始 RT-Splatting densification，True=FastGS
         self.fastgs_grad_thresh = 0.0002      # clone 判断：位置梯度阈值
         self.fastgs_grad_abs_thresh = 0.0002  # split 判断：尺寸梯度（scaling.grad）阈值
         self.fastgs_dense = 0.01              # 尺寸阈值因子（对应 percent_dense）

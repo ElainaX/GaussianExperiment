@@ -267,18 +267,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     # size_threshold：超过 occupancy_reset_interval 后才剔除屏幕过大的高斯
                     size_threshold = 20 if iteration > opt.occupancy_reset_interval else None
-                    # [FASTGS BEGIN] 多视角一致性引导的 densification + pruning
-                    # 采样一批视角，计算两个分数：
-                    #   importance_score：纯计数，门控 clone/split
-                    #   pruning_score：E_photo 加权计数，控制 prune 采样权重
-                    importance_score, pruning_score = compute_gaussian_score_rtsplat(
-                        scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=True
-                    )
-                    gaussians.densify_and_prune_fastgs(
-                        opt, importance_score, pruning_score,
-                        scene.cameras_extent, size_threshold, last_reset_iter
-                    )
-                    # [FASTGS END]
+                    if opt.fastgs_on:
+                        # [FASTGS BEGIN] 多视角一致性引导的 densification + pruning
+                        importance_score, pruning_score = compute_gaussian_score_rtsplat(
+                            scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=True
+                        )
+                        gaussians.densify_and_prune_fastgs(
+                            opt, importance_score, pruning_score,
+                            scene.cameras_extent, size_threshold, last_reset_iter
+                        )
+                        # [FASTGS END]
+                    else:
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold, opt.occupancy_cull,
+                            scene.cameras_extent, size_threshold, last_reset_iter
+                        )
 
                 # 定期将所有高斯的 occupancy（不透明度）重置为低值，
                 # 让无用高斯在下一轮被 prune 淘汰
