@@ -269,12 +269,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.occupancy_reset_interval else None
                     if opt.fastgs_on:
                         # [FASTGS BEGIN] 多视角一致性引导的 densification + pruning
-                        importance_score, pruning_score = compute_gaussian_score_rtsplat(
-                            scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=True
-                        )
+                        # 只有至少一个子模块需要分数时才跑多相机渲染
+                        need_scores = opt.fastgs_densify or opt.fastgs_prune
+                        importance_score = pruning_score = None
+                        if need_scores:
+                            importance_score, pruning_score = compute_gaussian_score_rtsplat(
+                                scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=True
+                            )
                         gaussians.densify_and_prune_fastgs(
                             opt, importance_score, pruning_score,
-                            scene.cameras_extent, size_threshold, last_reset_iter
+                            scene.cameras_extent, size_threshold, last_reset_iter,
+                            do_densify=opt.fastgs_densify,
+                            do_prune=opt.fastgs_prune,
                         )
                         # [FASTGS END]
                     else:

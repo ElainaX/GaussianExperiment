@@ -722,33 +722,37 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, extent, max_screen_size, last_reset_iter):
-        """FastGS 风格的 densification + pruning：
-        - clone：位置梯度大 + 尺寸小 + 多视角投票通过
-        - split：尺寸梯度大 + 尺寸大 + 多视角投票通过
-        - prune：低 occupancy + 多视角加权采样（预算控制，不一次全删）
+    def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, extent, max_screen_size, last_reset_iter,
+                                  do_densify=True, do_prune=True):
+        """FastGS 风格的 densification + pruning，支持子模块独立启用。
+
+        do_densify=True : 用多视角投票门控的 clone/split
+        do_densify=False: 退回标准梯度阈值 clone/split（importance_score 可为 None）
+        do_prune=True   : 用 pruning_score 加权预算采样剔除
+        do_prune=False  : 退回标准 occupancy 阈值一刀切（pruning_score 可为 None）
         """
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
 
-        grads_abs = self.xyz_gradient_accum_abs / self.denom
-        grads_abs[grads_abs.isnan()] = 0.0
+        if do_densify:
+            grads_abs = self.xyz_gradient_accum_abs / self.denom
+            grads_abs[grads_abs.isnan()] = 0.0
 
-        # 位置梯度判断 clone；尺寸梯度判断 split
-        grad_qualifiers = torch.norm(grad_vars, dim=-1) >= opt.fastgs_grad_thresh
-        grad_qualifiers_abs = torch.norm(grads_abs, dim=-1) >= opt.fastgs_grad_abs_thresh
+            grad_qualifiers = torch.norm(grad_vars, dim=-1) >= opt.fastgs_grad_thresh
+            grad_qualifiers_abs = torch.norm(grads_abs, dim=-1) >= opt.fastgs_grad_abs_thresh
+            clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= opt.fastgs_dense * extent
+            split_qualifiers = torch.max(self.get_scaling, dim=1).values > opt.fastgs_dense * extent
 
-        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= opt.fastgs_dense * extent
-        split_qualifiers = torch.max(self.get_scaling, dim=1).values > opt.fastgs_dense * extent
+            all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
+            all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
+            metric_mask = importance_score > opt.fastgs_min_importance
 
-        all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
-        all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
-
-        # 多视角投票门控：至少被 fastgs_min_importance 个视角认定为重建差
-        metric_mask = importance_score > opt.fastgs_min_importance
-
-        self.densify_and_clone_fastgs(metric_mask, all_clones)
-        self.densify_and_split_fastgs(metric_mask, all_splits)
+            self.densify_and_clone_fastgs(metric_mask, all_clones)
+            self.densify_and_split_fastgs(metric_mask, all_splits)
+        else:
+            # 标准梯度增殖（无多视角门控）
+            self.densify_and_clone(grad_vars, opt.densify_grad_threshold, extent)
+            self.densify_and_split(grad_vars, opt.densify_grad_threshold, extent)
 
         # Prune：低 occupancy / 屏幕过大 / 世界空间过大
         prune_mask = (self.get_occupancy < opt.occupancy_cull).squeeze()
@@ -758,20 +762,22 @@ class GaussianModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         prune_mask = torch.logical_and(prune_mask, self.last_update.squeeze() > last_reset_iter)
 
-        # 预算控制：每次只删一半候选，按 pruning_score 加权采样（优先删多视角误差大的）
-        to_remove = torch.sum(prune_mask).item()
-        remove_budget = int(0.5 * to_remove)
-        if remove_budget > 0:
-            n_pts = self.get_xyz.shape[0]
-            padded_score = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
-            score_len = min(pruning_score.shape[0], n_pts)
-            # score 越高越应该删，所以用 1/(1e-6 + (1-score)) 作为采样权重
-            padded_score[:score_len] = 1.0 / (1e-6 + 1.0 - pruning_score[:score_len].squeeze())
-            selected_pts_mask = torch.zeros(n_pts, dtype=torch.bool, device='cuda')
-            sampled_indices = torch.multinomial(padded_score, remove_budget, replacement=False)
-            selected_pts_mask[sampled_indices] = True
-            final_prune = torch.logical_and(prune_mask, selected_pts_mask)
-            self.prune_points(final_prune)
+        if do_prune:
+            # 预算控制：每次只删一半候选，按 pruning_score 加权采样（优先删多视角误差大的）
+            to_remove = torch.sum(prune_mask).item()
+            remove_budget = int(0.5 * to_remove)
+            if remove_budget > 0:
+                n_pts = self.get_xyz.shape[0]
+                padded_score = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
+                score_len = min(pruning_score.shape[0], n_pts)
+                padded_score[:score_len] = 1.0 / (1e-6 + 1.0 - pruning_score[:score_len].squeeze())
+                selected_pts_mask = torch.zeros(n_pts, dtype=torch.bool, device='cuda')
+                sampled_indices = torch.multinomial(padded_score, remove_budget, replacement=False)
+                selected_pts_mask[sampled_indices] = True
+                self.prune_points(torch.logical_and(prune_mask, selected_pts_mask))
+        else:
+            # 标准 occupancy 阈值剔除（无预算控制）
+            self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
 

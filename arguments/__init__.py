@@ -130,6 +130,8 @@ class OptimizationParams(ParamGroup):
 
         # [FASTGS BEGIN] 多视角一致性 densification 参数
         self.fastgs_on = False                # 总开关：False=原始 RT-Splatting densification，True=FastGS
+        self.fastgs_densify = False           # 子开关：是否用 FastGS 多视角门控的 clone/split（False=退回标准梯度增殖）
+        self.fastgs_prune = False             # 子开关：是否用 FastGS 加权预算 prune（False=退回标准 occupancy 阈值剔除）
         self.fastgs_grad_thresh = 0.0002      # clone 判断：位置梯度阈值
         self.fastgs_grad_abs_thresh = 0.0002  # split 判断：尺寸梯度（scaling.grad）阈值
         self.fastgs_dense = 0.01              # 尺寸阈值因子（对应 percent_dense）
