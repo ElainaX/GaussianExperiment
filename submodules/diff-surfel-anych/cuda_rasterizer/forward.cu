@@ -603,7 +603,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		float* out_extra, \
 		float* out_others, \
 		const int* metric_map, \
-		int* accum_metric_counts); \
+		int* accum_metric_counts, \
+		const float* protection_map, \
+		float* accum_protection); \
 	template void FORWARD::preprocess<N>( \
 		int P, int D, int M, \
 		const float* means3D, \
