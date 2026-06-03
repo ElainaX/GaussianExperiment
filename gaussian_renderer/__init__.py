@@ -13,7 +13,7 @@ from utils.point_utils import *
 from utils.sph_utils import *
 
 
-def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, metric_map=None):  # [FASTGS] metric_map: [H*W] int tensor，None 表示普通渲染
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, metric_map=None, protection_map=None):  # [FASTGS]
     """
     Render the scene.
 
@@ -63,7 +63,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     extras = torch.cat([opacity], dim=-1)
 
-    render_tran, volume_extras, _, volume_allmap, _ = rasterizer(  # [FASTGS] 末位 _ 为 accum_metric_counts，普通渲染路径忽略
+    render_tran, volume_extras, _, volume_allmap, _, _ = rasterizer(  # [FASTGS] 末两位为 accum_metric_counts/accum_protection，volume pass 不使用
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -100,8 +100,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     extras = torch.cat([pc.get_roughness, pc.get_language_feature, pc.get_inside_mask, pc.get_inside_mask * pc.get_reflectance, opacity, pc.get_inside_mask * pc.get_transmissivity], dim=-1)
 
-    # [FASTGS] metric_map 传入 surface pass（几何 pass），用于 per-Gaussian 多视角计数
-    render_scat, surface_extras, radii, surface_allmap, accum_metric_counts = rasterizer(
+    # [FASTGS] surface pass：metric_map 用于高误差计数，protection_map 用于边缘保护分
+    render_scat, surface_extras, radii, surface_allmap, accum_metric_counts, accum_protection = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -111,6 +111,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         rotations=rotations,
         cov3D_precomp=None,
         metric_map=metric_map,
+        protection_map=protection_map,
     )
 
     render_roughness, render_feature, foreground, render_reflectance, surface_opacity, render_transmissivity = surface_extras.split([1, 4, 1, 1, 1, 1], dim=0)
@@ -224,7 +225,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         'viewspace_points': means2D,
         'visibility_filter': radii > 0,
         'radii': radii,
-        'accum_metric_counts': accum_metric_counts,  # [FASTGS] per-Gaussian 多视角高误差覆盖次数
+        'accum_metric_counts': accum_metric_counts,  # [FASTGS] per-Gaussian 高误差像素覆盖计数
+        'accum_protection': accum_protection,         # [FASTGS] per-Gaussian alpha加权边缘保护分
     }
 
     return rets

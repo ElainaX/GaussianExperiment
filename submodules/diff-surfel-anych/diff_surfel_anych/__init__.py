@@ -33,7 +33,8 @@ def rasterize_gaussians(
     cov3Ds_precomp,
     raster_settings,
     num_extra_channels,
-    metric_map=None,  # [FASTGS] 可选：高误差像素标记 [H*W]，None 表示不启用计数
+    metric_map=None,      # [FASTGS] 可选：高误差像素标记 [H*W] int
+    protection_map=None,  # [FASTGS] 可选：边缘×深度保护权重 [H*W] float
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -46,7 +47,8 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         raster_settings,
         num_extra_channels,
-        metric_map,  # [FASTGS]
+        metric_map,       # [FASTGS]
+        protection_map,   # [FASTGS]
     )
 
 
@@ -64,7 +66,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         cov3Ds_precomp,
         raster_settings,
         num_channels,
-        metric_map,  # [FASTGS] 可选：高误差像素标记，None 时不启用计数
+        metric_map,      # [FASTGS] 可选：高误差像素标记
+        protection_map,  # [FASTGS] 可选：边缘×深度保护权重
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -88,8 +91,9 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.debug,
-            # [FASTGS BEGIN] 传入 metric_map；None 时传空 Tensor，C++ 侧检测 numel()==0 后跳过计数
+            # [FASTGS BEGIN] None → 空 Tensor，C++ 侧 numel()==0 时跳过
             metric_map if metric_map is not None else torch.Tensor(),
+            protection_map if protection_map is not None else torch.Tensor(),
             # [FASTGS END]
         )
 
@@ -98,7 +102,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
                 # [FASTGS] 解包 9-tuple，新增 accum_metric_counts
-                num_rendered, color, extra, depth, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts = getattr(_C, f'rasterize_gaussians_{num_channels}')(*args)
+                num_rendered, color, extra, depth, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts, accum_protection = getattr(_C, f'rasterize_gaussians_{num_channels}')(*args)
             except Exception as ex:
                 torch.save(cpu_args, 'snapshot_fw.dump')
                 print('\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.')
@@ -112,11 +116,11 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.num_rendered = num_rendered
         ctx.num_channels = num_channels
         ctx.save_for_backward(extras, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
-        # [FASTGS] 返回值末位追加 accum_metric_counts（int tensor，不参与梯度计算）
-        return color, extra, radii, depth, accum_metric_counts
+        # [FASTGS] 返回 6-tuple：末位新增 accum_metric_counts 和 accum_protection
+        return color, extra, radii, depth, accum_metric_counts, accum_protection
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_out_extra, grad_radii, grad_depth, grad_accum_metric_counts):  # [FASTGS] 新增 grad_accum_metric_counts（忽略）
+    def backward(ctx, grad_out_color, grad_out_extra, grad_radii, grad_depth, grad_accum_metric_counts, grad_accum_protection):  # [FASTGS] 新增两个忽略的 grad
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -175,6 +179,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # protection_map
         )
 
         return grads
@@ -208,7 +213,7 @@ class GaussianRasterizer(nn.Module):
 
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs=None, extras=None, scales=None, rotations=None, cov3D_precomp=None, metric_map=None):  # [FASTGS] 新增可选参数 metric_map
+    def forward(self, means3D, means2D, opacities, shs=None, extras=None, scales=None, rotations=None, cov3D_precomp=None, metric_map=None, protection_map=None):  # [FASTGS]
 
         if extras is None:
             num_channels = 0
@@ -232,8 +237,7 @@ class GaussianRasterizer(nn.Module):
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([]).cuda()
 
-        # Invoke C++/CUDA rasterization routine
-        # [FASTGS] 传入 metric_map，返回值新增 accum_metric_counts（调用方从返回 tuple 末位取）
+        # [FASTGS] 传入 metric_map 和 protection_map，返回 6-tuple
         return rasterize_gaussians(
             means3D,
             means2D,
@@ -245,5 +249,6 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             raster_settings,
             num_channels,
-            metric_map,  # [FASTGS]
+            metric_map,
+            protection_map,
         )

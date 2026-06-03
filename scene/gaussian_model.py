@@ -722,7 +722,8 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, extent, max_screen_size, last_reset_iter,
+    def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, protection_score,
+                                  extent, max_screen_size, last_reset_iter,
                                   do_densify=True, do_prune=True):
         """FastGS 风格的 densification + pruning，支持子模块独立启用。
 
@@ -782,6 +783,14 @@ class GaussianModel:
                 padded_score = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
                 score_len = min(pruning_score.shape[0], n_pts)
                 padded_score[:score_len] = 1.0 / (1e-6 + 1.0 - pruning_score[:score_len].squeeze())
+
+                # 边缘保护：高 protection_score 的高斯（高边缘+远深度）降低被采样到的权重
+                # 相当于俄罗斯轮盘赌 —— protection 越高，被 prune 的概率越低
+                if protection_score is not None:
+                    prot_len = min(protection_score.shape[0], n_pts)
+                    padded_prot = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
+                    padded_prot[:prot_len] = protection_score[:prot_len].squeeze()
+                    padded_score = padded_score * (1.0 - padded_prot)
                 selected_pts_mask = torch.zeros(n_pts, dtype=torch.bool, device='cuda')
                 sampled_indices = torch.multinomial(padded_score, remove_budget, replacement=False)
                 selected_pts_mask[sampled_indices] = True

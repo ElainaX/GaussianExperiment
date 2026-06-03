@@ -36,8 +36,8 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 }
 
 template<int NUM_CHANNELS>
-// [FASTGS] 返回值扩展为 9-tuple，末位新增 accum_metric_counts
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// [FASTGS] 返回值扩展为 10-tuple：新增 accum_metric_counts 和 accum_protection
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -58,8 +58,9 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool debug,
-	// [FASTGS BEGIN] 可选输入：高误差像素标记 [H*W]，空 Tensor 表示不启用计数
-	const torch::Tensor& metric_map
+	// [FASTGS BEGIN]
+	const torch::Tensor& metric_map,      // [H*W] int  高误差像素标记，空 Tensor 跳过
+	const torch::Tensor& protection_map   // [H*W] float 边缘×深度保护权重，空 Tensor 跳过
 	// [FASTGS END]
 	)
 {
@@ -98,8 +99,9 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_extra = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
-  // [FASTGS BEGIN] 分配 per-Gaussian 计数 tensor，初始化为 0
+  // [FASTGS BEGIN] 分配 per-Gaussian 计数/保护分 tensor
   torch::Tensor accum_metric_counts = torch::zeros({P}, int_opts);
+  torch::Tensor accum_protection    = torch::zeros({P}, float_opts);
   // [FASTGS END]
   
   torch::Device device(torch::kCUDA);
@@ -120,10 +122,11 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
 	  }
 
-	  // [FASTGS BEGIN] 解析 metric_map：空 Tensor 时传 nullptr，否则传 data_ptr
+	  // [FASTGS BEGIN] 解析可选输入指针，空 Tensor → nullptr
 	  const int* metric_map_ptr = (metric_map.defined() && metric_map.numel() > 0)
-	      ? metric_map.contiguous().data_ptr<int>()
-	      : nullptr;
+	      ? metric_map.contiguous().data_ptr<int>() : nullptr;
+	  const float* protection_map_ptr = (protection_map.defined() && protection_map.numel() > 0)
+	      ? protection_map.contiguous().data_ptr<float>() : nullptr;
 	  // [FASTGS END]
 
 	  rendered = CudaRasterizer::Rasterizer::forward<NUM_CHANNELS>(
@@ -154,13 +157,15 @@ RasterizeGaussiansCUDA(
 		debug,
 		// [FASTGS BEGIN]
 		metric_map_ptr,
-		accum_metric_counts.contiguous().data_ptr<int>()
+		accum_metric_counts.contiguous().data_ptr<int>(),
+		protection_map_ptr,
+		accum_protection.contiguous().data_ptr<float>()
 		// [FASTGS END]
 		);
 
   }
-  // [FASTGS] 返回值末位追加 accum_metric_counts
-  return std::make_tuple(rendered, out_color, out_extra, out_others, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts);
+  // [FASTGS] 返回 10-tuple：末位新增 accum_metric_counts 和 accum_protection
+  return std::make_tuple(rendered, out_color, out_extra, out_others, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts, accum_protection);
 }
 
 template<int NUM_CHANNELS>
@@ -290,7 +295,7 @@ torch::Tensor markVisible(
 
 
 #define X(N) \
-	template std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
+	template std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
 	RasterizeGaussiansCUDA<N>( \
 		const torch::Tensor& background, \
 		const torch::Tensor& means3D, \
@@ -311,7 +316,8 @@ torch::Tensor markVisible(
 		const torch::Tensor& campos, \
 		const bool prefiltered, \
 		const bool debug, \
-		const torch::Tensor& metric_map); \
+		const torch::Tensor& metric_map, \
+		const torch::Tensor& protection_map); \
 	template std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> \
 	RasterizeGaussiansBackwardCUDA<N>( \
 		const torch::Tensor& background, \

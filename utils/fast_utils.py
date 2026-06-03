@@ -11,6 +11,17 @@ def _sample_cameras(viewpoint_stack, num_cams):
     return [viewpoint_stack[i] for i in indices]
 
 
+def _sobel_edge(img_gray_hw):
+    """输入 [H,W] float tensor，输出归一化边缘强度 [H,W]，值域 [0,1]。"""
+    k_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=img_gray_hw.device).view(1,1,3,3)
+    k_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=img_gray_hw.device).view(1,1,3,3)
+    g = img_gray_hw.view(1,1,*img_gray_hw.shape)
+    ex = F.conv2d(g, k_x, padding=1)[0,0]
+    ey = F.conv2d(g, k_y, padding=1)[0,0]
+    edge = torch.sqrt(ex**2 + ey**2)
+    return edge / (edge.max() + 1e-6)
+
+
 def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DENSIFY=False):
     """计算每个高斯的多视角重建质量分数，用于指导 densification 和 pruning。
 
@@ -40,60 +51,68 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
     """
     camlist = _sample_cameras(viewpoint_stack, opt.fastgs_num_cams)
 
-    full_metric_counts = None   # Σ accum_counts（纯计数，给 importance_score 用）
-    full_metric_score = None    # Σ E_photo × accum_counts（加权，给 pruning_score 用）
+    full_metric_counts = None   # Σ accum_counts（给 importance_score 用）
+    full_metric_score  = None   # Σ E_photo × accum_counts（给 pruning_score 用）
+    full_protection    = None   # Σ accum_protection（给 protection_score 用）
 
     with torch.no_grad():
         for cam in camlist:
-            # ── 第一次渲染：得到图像，计算高误差像素位置 ──────────────────────
+            # ── 第一次渲染：得到图像、深度，计算高误差像素和保护权重 ───────────
             pkg = render(cam, gaussians, pipe, bg)
             rendered = pkg['final_rendering']
             gt = cam.original_image.cuda()
 
-            # 像素级 L1，归一化到 [0,1]
+            # 像素级 L1
             l1_per_pixel = torch.mean(torch.abs(rendered - gt), dim=0)  # [H, W]
-            l1_min, l1_max = l1_per_pixel.min(), l1_per_pixel.max()
-            if l1_max - l1_min < 1e-6:
-                continue
-            l1_norm = (l1_per_pixel - l1_min) / (l1_max - l1_min)
+            l1_mean = l1_per_pixel.mean()
+            if l1_mean < 1e-6:
+                continue  # 该视角几乎完美，跳过
 
-            # E_photo：视角级光度损失（L1 + SSIM 混合），作为 pruning_score 的权重
-            Ll1 = torch.mean(torch.abs(rendered - gt))
-            ssim_val = 1.0 - F.mse_loss(rendered, gt)      # 近似 SSIM，计算廉价
-            e_photo = (1.0 - 0.2) * Ll1 + 0.2 * (1.0 - ssim_val)
+            e_photo = l1_mean  # 视角权重
 
-            # 高误差像素标记 [H*W]，int32，供 CUDA atomicAdd 使用
-            metric_map = (l1_norm > opt.fastgs_loss_thresh).int().flatten()
+            # 高误差像素标记（超过全图均值的才标记）
+            metric_map = (l1_per_pixel > l1_mean).int().flatten()  # [H*W] int
 
-            # ── 第二次渲染：传入 metric_map，CUDA 统计 per-Gaussian 计数 ────────
-            pkg2 = render(cam, gaussians, pipe, bg, metric_map=metric_map)
-            accum_counts = pkg2['accum_metric_counts']  # [N]，int32
+            # 保护图：Sobel边缘强度 × 归一化深度
+            # 高边缘+远深度 → 背景轮廓区域 → 减少被 prune 的概率
+            depth = pkg['surface_depth'].squeeze()           # [H, W]
+            depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+            edge = _sobel_edge(gt.mean(dim=0))               # [H, W]
+            protection_map = (edge * depth_norm).flatten()   # [H*W] float
 
-            # ── 累积 importance_score（纯计数） ───────────────────────────────
+            # ── 第二次渲染：传入 metric_map 和 protection_map ─────────────────
+            pkg2 = render(cam, gaussians, pipe, bg,
+                          metric_map=metric_map,
+                          protection_map=protection_map)
+            accum_counts      = pkg2['accum_metric_counts']  # [N] int
+            accum_protect     = pkg2['accum_protection']     # [N] float
+
+            # ── 累积各分数 ────────────────────────────────────────────────────
             if DENSIFY:
-                if full_metric_counts is None:
-                    full_metric_counts = accum_counts.clone().float()
-                else:
-                    full_metric_counts += accum_counts.float()
+                full_metric_counts = accum_counts.float() if full_metric_counts is None \
+                    else full_metric_counts + accum_counts.float()
 
-            # ── 累积 pruning_score（E_photo 加权） ────────────────────────────
             weighted = e_photo.item() * accum_counts.float()
-            if full_metric_score is None:
-                full_metric_score = weighted
-            else:
-                full_metric_score += weighted
+            full_metric_score = weighted if full_metric_score is None \
+                else full_metric_score + weighted
+
+            full_protection = accum_protect.clone() if full_protection is None \
+                else full_protection + accum_protect
 
     if full_metric_score is None:
-        # 所有视角误差太小，退化为全零分数
         N = gaussians.get_xyz.shape[0]
-        return (torch.zeros(N, device='cuda') if DENSIFY else None), torch.zeros(N, device='cuda')
+        z = torch.zeros(N, device='cuda')
+        return (z if DENSIFY else None), z, z
+
+    def _norm01(t):
+        lo, hi = t.min(), t.max()
+        return (t - lo) / (hi - lo + 1e-6)
 
     # pruning_score：E_photo 加权，归一化到 [0,1]
-    s_min, s_max = full_metric_score.min(), full_metric_score.max()
-    if s_max - s_min < 1e-6:
-        pruning_score = torch.zeros_like(full_metric_score)
-    else:
-        pruning_score = (full_metric_score - s_min) / (s_max - s_min)
+    pruning_score = _norm01(full_metric_score)
+
+    # protection_score：边缘×深度保护分，归一化到 [0,1]
+    protection_score = _norm01(full_protection)
 
     # importance_score：纯计数，按视角数取整均值
     if DENSIFY:
@@ -101,4 +120,4 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
     else:
         importance_score = None
 
-    return importance_score, pruning_score
+    return importance_score, pruning_score, protection_score

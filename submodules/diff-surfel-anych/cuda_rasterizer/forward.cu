@@ -276,9 +276,11 @@ renderCUDA(
 	float* __restrict__ out_color,
 	float* __restrict__ out_extra,
 	float* __restrict__ out_others,
-	// [FASTGS BEGIN] 多视角重建质量计数所需新增参数
-	const int* __restrict__ metric_map,  // 输入：[H*W] 高误差像素标记，nullptr 表示跳过
-	int* accum_metric_counts             // 输出：[N] per-Gaussian 被高误差视角覆盖的累积次数
+	// [FASTGS BEGIN]
+	const int* __restrict__ metric_map,         // [H*W] int  高误差像素标记
+	int*   accum_metric_counts,                 // [N]   per-Gaussian 高误差计数
+	const float* __restrict__ protection_map,   // [H*W] float 边缘×深度保护权重
+	float* accum_protection                     // [N]   per-Gaussian alpha加权保护分
 	// [FASTGS END]
 	)
 {
@@ -407,9 +409,13 @@ renderCUDA(
 
 			float w = alpha * T;
 
-			// [FASTGS BEGIN] 若当前像素被标记为高误差，则对覆盖该像素的高斯计数 +1
+			// [FASTGS BEGIN]
 			if (metric_map != nullptr && metric_map[pix_id]) {
 				atomicAdd(&accum_metric_counts[collected_id[j]], 1);
+			}
+			if (protection_map != nullptr) {
+				// alpha加权累积：贡献越大的高斯，保护分越高
+				atomicAdd(&accum_protection[collected_id[j]], protection_map[pix_id] * w);
 			}
 			// [FASTGS END]
 
@@ -491,7 +497,9 @@ void FORWARD::render(
 	float* out_others,
 	// [FASTGS BEGIN]
 	const int* metric_map,
-	int* accum_metric_counts
+	int* accum_metric_counts,
+	const float* protection_map,
+	float* accum_protection
 	// [FASTGS END]
 	)
 {
@@ -514,7 +522,9 @@ void FORWARD::render(
 		out_others,
 		// [FASTGS BEGIN]
 		metric_map,
-		accum_metric_counts
+		accum_metric_counts,
+		protection_map,
+		accum_protection
 		// [FASTGS END]
 		);
 }

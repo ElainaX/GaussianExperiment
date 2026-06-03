@@ -223,7 +223,9 @@ int CudaRasterizer::Rasterizer::forward(
 	bool debug,
 	// [FASTGS BEGIN]
 	const int* metric_map,
-	int* accum_metric_counts
+	int* accum_metric_counts,
+	const float* protection_map,
+	float* accum_protection
 	// [FASTGS END]
 	)
 {
@@ -343,7 +345,9 @@ int CudaRasterizer::Rasterizer::forward(
 		out_others,
 		// [FASTGS BEGIN]
 		metric_map,
-		accum_metric_counts
+		accum_metric_counts,
+		protection_map,
+		accum_protection
 		// [FASTGS END]
 		), debug)
 
@@ -490,7 +494,9 @@ void CudaRasterizer::Rasterizer::backward(
 		int* radii, \
 		bool debug, \
 		const int* metric_map, \
-		int* accum_metric_counts); \
+		int* accum_metric_counts, \
+		const float* protection_map, \
+		float* accum_protection); \
 	template void CudaRasterizer::Rasterizer::backward<N>( \
 		const int P, int D, int M, int R, \
 		const float* background, \

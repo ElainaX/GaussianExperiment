@@ -152,6 +152,72 @@ def compute_heatmap_rendered(gaussians, cam, pipe, bg):
     return hmap.view(H, W).cpu().numpy()   # raw counts, scaling applied later
 
 
+@torch.no_grad()
+def compute_heatmap_per_pixel(gaussians, cam, pipe, bg):
+    """
+    Per-pixel Gaussian influence count: for each pixel, how many Gaussian
+    screen-space footprints overlap it?
+
+    Algorithm: integral-image (2-D prefix sum) trick — O(N + H*W), no CUDA changes.
+
+    Each Gaussian's footprint is its axis-aligned bounding box on screen,
+    derived from `radii` — the same per-Gaussian screen-space radius the
+    CUDA rasterizer uses for tile assignment, so the coverage is consistent
+    with what actually gets blended.
+
+    Invisible / frustum-culled Gaussians (radii == 0) are excluded.
+    """
+    H = cam.image_height
+    W = cam.image_width
+
+    # One render pass to obtain screen-space radii (same values the tiler uses)
+    pkg = gs_render(cam, gaussians, pipe, bg)
+    radii = pkg['radii']  # [N] integer pixels; 0 = not visible
+
+    # Project Gaussian centres to pixel space
+    xyz   = gaussians.get_xyz                              # [N, 3]
+    N     = xyz.shape[0]
+    ones  = torch.ones(N, 1, device=xyz.device)
+    xyz_h = torch.cat([xyz, ones], dim=1)                  # [N, 4]
+    ndc_h = xyz_h @ cam.full_proj_transform
+    w_h   = ndc_h[:, 3:4].clamp(min=1e-6)
+    ndc   = ndc_h[:, :3] / w_h
+
+    cx = (ndc[:, 0] + 1.0) * 0.5 * W   # float pixel x
+    cy = (ndc[:, 1] + 1.0) * 0.5 * H   # float pixel y
+
+    # Keep only visible Gaussians
+    vis = radii > 0
+    if vis.sum() == 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    cx_v = cx[vis]
+    cy_v = cy[vis]
+    r_v  = radii[vis].float()
+
+    # Axis-aligned bounding boxes clamped to the image
+    x1 = (cx_v - r_v).long().clamp(0, W)
+    x2 = (cx_v + r_v + 1).long().clamp(0, W)
+    y1 = (cy_v - r_v).long().clamp(0, H)
+    y2 = (cy_v + r_v + 1).long().clamp(0, H)
+
+    # 2-D difference array — each bounding box adds +1 at (y1,x1) and
+    # subtracts at the three other corners, so a 2-D prefix sum recovers
+    # the exact overlap count at every pixel in O(N + H*W).
+    W1   = W + 1
+    diff = torch.zeros((H + 1) * W1, device=xyz.device, dtype=torch.float32)
+    v    = torch.ones(vis.sum(), device=xyz.device, dtype=torch.float32)
+
+    diff.scatter_add_(0, y1 * W1 + x1, +v)
+    diff.scatter_add_(0, y1 * W1 + x2, -v)
+    diff.scatter_add_(0, y2 * W1 + x1, -v)
+    diff.scatter_add_(0, y2 * W1 + x2, +v)
+
+    # 2-D prefix sum → per-pixel Gaussian count
+    count = diff.view(H + 1, W1).cumsum(dim=0).cumsum(dim=1)[:H, :W]
+    return count.cpu().numpy()   # raw integer counts, scaling applied later
+
+
 def blur_heatmap(hmap, sigma):
     """Optional Gaussian blur to smooth sparse heatmaps."""
     from scipy.ndimage import gaussian_filter
@@ -224,9 +290,11 @@ if __name__ == '__main__':
                         help='Checkpoint iteration to load (-1 = latest)')
     parser.add_argument('--cameras', nargs='+', default=['test'],
                         help='"train", "test", or integer indices into the test set')
-    parser.add_argument('--mode', choices=['project', 'rendered'], default='project',
-                        help='"project": fast point-cloud projection; '
-                             '"rendered": uses CUDA accum_metric_counts (slower, more accurate)')
+    parser.add_argument('--mode', choices=['project', 'rendered', 'per_pixel'],
+                        default='per_pixel',
+                        help='"per_pixel": per-pixel Gaussian footprint overlap count (default); '
+                             '"project": fast center projection; '
+                             '"rendered": CUDA accum_metric_counts per-Gaussian')
     parser.add_argument('--weight', choices=['count', 'opacity'], default='count',
                         help='Per-Gaussian weight for --mode project: "count" or "opacity"')
     parser.add_argument('--overlay', action='store_true',
@@ -299,7 +367,9 @@ if __name__ == '__main__':
                   f'{cam.image_width}×{cam.image_height}')
 
         # Build heatmap: raw counts → scale → optional blur
-        if args.mode == 'rendered':
+        if args.mode == 'per_pixel':
+            hmap = compute_heatmap_per_pixel(gaussians, cam, pipe, background)
+        elif args.mode == 'rendered':
             hmap = compute_heatmap_rendered(gaussians, cam, pipe, background)
         else:
             hmap = compute_heatmap(gaussians, cam, weight_mode=args.weight)
