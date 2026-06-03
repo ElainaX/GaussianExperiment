@@ -101,15 +101,15 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args)  # Copy them before they can be corrupted
             try:
-                # [FASTGS] 解包 9-tuple，新增 accum_metric_counts
+                # [FASTGS] 解包 10-tuple
                 num_rendered, color, extra, depth, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts, accum_protection = getattr(_C, f'rasterize_gaussians_{num_channels}')(*args)
             except Exception as ex:
                 torch.save(cpu_args, 'snapshot_fw.dump')
                 print('\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.')
                 raise ex
         else:
-            # [FASTGS] 解包 9-tuple，新增 accum_metric_counts
-            num_rendered, color, extra, depth, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts = getattr(_C, f'rasterize_gaussians_{num_channels}')(*args)
+            # [FASTGS] 解包 10-tuple
+            num_rendered, color, extra, depth, radii, geomBuffer, binningBuffer, imgBuffer, accum_metric_counts, accum_protection = getattr(_C, f'rasterize_gaussians_{num_channels}')(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings

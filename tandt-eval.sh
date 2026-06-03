@@ -1,6 +1,6 @@
 python train.py \
     -s ~/autodl-tmp/data/tandt/tandt/truck \
-    -m ~/autodl-tmp/model/rtsplat/tandt/fastgs_off+remove_lpips/truck \
+    -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_on/truck \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
     --env_scope_radius 1 \
@@ -18,6 +18,6 @@ python train.py \
     --fastgs_num_cams 10 \
     --lambda_lpips 0
 
-python render.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgs_off+remove_lpips/truck
+python render.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_on/truck
 
-python metrics.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgs_off+remove_lpips/truck
+python metrics.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_on/truck
