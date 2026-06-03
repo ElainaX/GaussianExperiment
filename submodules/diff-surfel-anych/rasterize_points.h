@@ -16,8 +16,8 @@
 #include <string>
 	
 template<int NUM_CHANNELS>
-// [FASTGS] 返回值从 8-tuple 扩展为 9-tuple，新增 accum_metric_counts
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// [FASTGS] 返回值扩展为 10-tuple：新增 accum_metric_counts 和 accum_protection
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -38,8 +38,9 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool debug,
-	// [FASTGS BEGIN] 可选输入：高误差像素标记 [H*W]，空 Tensor 表示不启用计数
-	const torch::Tensor& metric_map = torch::Tensor()
+	// [FASTGS BEGIN]
+	const torch::Tensor& metric_map = torch::Tensor(),
+	const torch::Tensor& protection_map = torch::Tensor()
 	// [FASTGS END]
 	);
 
