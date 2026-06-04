@@ -282,6 +282,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             scene.cameras_extent, size_threshold, last_reset_iter,
                             do_densify=opt.fastgs_densify,
                             do_prune=opt.fastgs_prune,
+                            do_protect_prune=opt.fastgs_protect_prune,
+                            do_protect_densify=opt.fastgs_protect_densify,
                         )
                         # [FASTGS END]
                     else:

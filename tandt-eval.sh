@@ -10,6 +10,8 @@ python train.py \
     --fastgs_on \
     --fastgs_densify \
     --fastgs_prune \
+    --fastgs_protect_prune \
+    --fastgs_protect_densify \
     --fastgs_grad_thresh 0.0002 \
     --fastgs_grad_abs_thresh 0.0002 \
     --fastgs_dense 0.01 \

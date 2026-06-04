@@ -724,13 +724,16 @@ class GaussianModel:
 
     def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, protection_score,
                                   extent, max_screen_size, last_reset_iter,
-                                  do_densify=True, do_prune=True):
+                                  do_densify=True, do_prune=True,
+                                  do_protect_prune=True, do_protect_densify=False):
         """FastGS 风格的 densification + pruning，支持子模块独立启用。
 
-        do_densify=True : 用多视角投票门控的 clone/split
-        do_densify=False: 退回标准梯度阈值 clone/split（importance_score 可为 None）
-        do_prune=True   : 用 pruning_score 加权预算采样剔除
-        do_prune=False  : 退回标准 occupancy 阈值一刀切（pruning_score 可为 None）
+        do_densify=True       : 用多视角投票门控的 clone/split
+        do_densify=False      : 退回标准梯度阈值 clone/split（importance_score 可为 None）
+        do_prune=True         : 用 pruning_score 加权预算采样剔除
+        do_prune=False        : 退回标准 occupancy 阈值一刀切（pruning_score 可为 None）
+        do_protect_prune=True : prune 时高 protection 高斯降低被采样概率
+        do_protect_densify=True: densify 时高 protection 高斯降低重要性阈值（更易参与增殖）
         """
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -746,7 +749,17 @@ class GaussianModel:
 
             all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
             all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
-            metric_mask = importance_score > opt.fastgs_min_importance
+
+            # 边缘保护加分：高 protection_score 降低有效阈值，使轮廓区域高斯更易参与增殖
+            # 对应 prune 侧的 weight*(1-protection)，这里做 thresh*(1-protection)
+            if do_protect_densify and protection_score is not None:
+                n_imp = importance_score.shape[0]
+                prot_len = min(protection_score.shape[0], n_imp)
+                eff_thresh = torch.full((n_imp,), float(opt.fastgs_min_importance), device='cuda')
+                eff_thresh[:prot_len] -= protection_score[:prot_len].squeeze() * opt.fastgs_min_importance
+                metric_mask = importance_score.float() > eff_thresh
+            else:
+                metric_mask = importance_score > opt.fastgs_min_importance
 
             self.densify_and_clone_fastgs(metric_mask, all_clones)
             self.densify_and_split_fastgs(metric_mask, all_splits)
@@ -786,7 +799,7 @@ class GaussianModel:
 
                 # 边缘保护：高 protection_score 的高斯（高边缘+远深度）降低被采样到的权重
                 # 相当于俄罗斯轮盘赌 —— protection 越高，被 prune 的概率越低
-                if protection_score is not None:
+                if do_protect_prune and protection_score is not None:
                     prot_len = min(protection_score.shape[0], n_pts)
                     padded_prot = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
                     padded_prot[:prot_len] = protection_score[:prot_len].squeeze()
