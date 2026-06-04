@@ -725,7 +725,7 @@ class GaussianModel:
     def densify_and_prune_fastgs(self, opt, importance_score, pruning_score, protection_score,
                                   extent, max_screen_size, last_reset_iter,
                                   do_densify=True, do_prune=True,
-                                  do_protect_prune=True, do_protect_densify=False):
+                                  do_protect_prune=False, do_protect_densify=False):
         """FastGS 风格的 densification + pruning，支持子模块独立启用。
 
         do_densify=True       : 用多视角投票门控的 clone/split
