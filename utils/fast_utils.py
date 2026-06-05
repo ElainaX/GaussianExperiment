@@ -22,19 +22,21 @@ def _sobel_edge(img_gray_hw):
     return edge / (edge.max() + 1e-6)
 
 
-def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DENSIFY=False):
+def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, skip_importance=False):
     """计算每个高斯的多视角重建质量分数，用于指导 densification 和 pruning。
 
     对 opt.fastgs_num_cams 个随机相机视角渲染场景：
     - 先渲染得到图像，计算像素级 L1 误差并归一化，标出高误差像素 metric_map
     - 再用 metric_map 渲染，让 CUDA 统计每个高斯覆盖了多少个高误差像素（accum_counts）
-    - 同时记录当前视角的光度误差 E_photo = L1 + SSIM 混合损失
+    - 同时记录当前视角的光度误差 E_photo = L1 均值
 
-    两个分数分别计算，物理含义不同：
+    三个分数物理含义不同：
       importance_score = floor(Σ accum_counts / |cams|)
-        → 纯计数，平均有多少视角认为该高斯重建差，用于 densification 门控
+        → 纯计数，平均有多少视角认为该高斯重建差，用于 densification 门控（默认常驻）
       pruning_score = normalize(Σ E_photo × accum_counts)
         → E_photo 加权计数，重建误差大的视角权重更高，用于 pruning 采样权重
+      protection_score = normalize(Σ accum_protection)
+        → alpha加权的边缘×深度保护分，用于 prune 时降低背景轮廓高斯的被删概率
 
     Args:
         viewpoint_stack: 训练相机列表
@@ -42,12 +44,13 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
         pipe: 渲染 pipeline 参数
         bg: 背景颜色 tensor
         opt: OptimizationParams，使用 fastgs_num_cams / fastgs_loss_thresh 字段
-        DENSIFY (bool): True 时才计算 importance_score（split/clone 路径需要），
-                        False 时只计算 pruning_score（final prune 路径）
+        skip_importance (bool): True 时跳过 importance_score 的累积与计算，返回 None；
+                                默认 False，即 importance_score 常驻计算
 
     Returns:
-        importance_score (Tensor | None): [N] per-Gaussian 整数计数，DENSIFY=False 时为 None
+        importance_score (Tensor | None): [N] per-Gaussian 整数计数，skip_importance=True 时为 None
         pruning_score (Tensor): [N] 归一化到 [0,1] 的 E_photo 加权分数
+        protection_score (Tensor): [N] 归一化到 [0,1] 的边缘×深度保护分
     """
     camlist = _sample_cameras(viewpoint_stack, opt.fastgs_num_cams)
 
@@ -88,7 +91,7 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
             accum_protect     = pkg2['accum_protection']     # [N] float
 
             # ── 累积各分数 ────────────────────────────────────────────────────
-            if DENSIFY:
+            if not skip_importance:
                 full_metric_counts = accum_counts.float() if full_metric_counts is None \
                     else full_metric_counts + accum_counts.float()
 
@@ -102,7 +105,7 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
     if full_metric_score is None:
         N = gaussians.get_xyz.shape[0]
         z = torch.zeros(N, device='cuda')
-        return (z if DENSIFY else None), z, z
+        return (None if skip_importance else z), z, z
 
     def _norm01(t):
         lo, hi = t.min(), t.max()
@@ -114,8 +117,8 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, DE
     # protection_score：边缘×深度保护分，归一化到 [0,1]
     protection_score = _norm01(full_protection)
 
-    # importance_score：纯计数，按视角数取整均值
-    if DENSIFY:
+    # importance_score：纯计数，按视角数取整均值（skip_importance=True 时跳过）
+    if not skip_importance:
         importance_score = torch.div(full_metric_counts, len(camlist), rounding_mode='floor')
     else:
         importance_score = None

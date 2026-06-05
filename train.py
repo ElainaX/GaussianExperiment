@@ -275,7 +275,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if need_scores:
                             importance_score, pruning_score, protection_score = \
                                 compute_gaussian_score_rtsplat(
-                                    scene.getTrainCameras(), gaussians, pipe, bg, opt, DENSIFY=opt.fastgs_densify
+                                    scene.getTrainCameras(), gaussians, pipe, bg, opt
                                 )
                         gaussians.densify_and_prune_fastgs(
                             opt, importance_score, pruning_score, protection_score,
