@@ -790,7 +790,8 @@ class GaussianModel:
         if do_prune:
             # 预算控制：每次只删一半候选，按 pruning_score 加权采样（优先删多视角误差大的）
             to_remove = torch.sum(prune_mask).item()
-            remove_budget = int(0.5 * to_remove)
+            #remove_budget = int(0.5 * to_remove)
+            remove_budget = int(to_remove)
             if remove_budget > 0:
                 n_pts = self.get_xyz.shape[0]
                 padded_score = torch.zeros(n_pts, dtype=torch.float32, device='cuda')
