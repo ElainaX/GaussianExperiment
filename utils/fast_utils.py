@@ -126,27 +126,32 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, sk
     return importance_score, pruning_score, protection_score
 
 
-def edge_aware_loss(rendered, gt, depth):
-    """边缘感知 loss：对齐渲染图与 GT 图的「边缘强度 × 归一化深度」分布。
+def edge_aware_loss(depth, gt):
+    """边缘感知深度平滑 loss：在 GT 图像平坦区域惩罚深度变化，边缘区域放行不连续。
 
-    边缘强度由 Sobel 算子计算，深度作为空间权重让损失聚焦于有几何意义的边缘区域
-    （远景背景轮廓权重高，近景内部纹理权重低）。
+    用 exp(-|∂I/∂x|) 作为权重：GT 无纹理处权重≈1（强惩罚深度跳变），
+    GT 有边缘处权重≈0（允许深度不连续），避免纹理边缘造成假深度跳变。
 
     Args:
-        rendered : [3, H, W] float，渲染图（需要梯度）
-        gt       : [3, H, W] float，GT 原图（no grad）
-        depth    : [1, H, W] 或 [H, W] float，渲染深度（detach 后用作权重）
+        depth : [1, H, W] 或 [H, W] float，surface_depth（保留梯度）
+        gt    : [3, H, W] float，GT 原图（no grad）
 
     Returns:
-        scalar loss（MSE）
+        scalar loss
     """
-    depth = depth.squeeze().detach()
-    depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+    depth_sq = depth.squeeze()
+    gt_gray  = gt.mean(dim=0).detach()
 
-    rendered_edge = _sobel_edge(rendered.mean(dim=0))        # [H, W]，有梯度
-    gt_edge       = _sobel_edge(gt.mean(dim=0).detach())     # [H, W]，无梯度
+    k_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32,
+                        device=depth_sq.device).view(1, 1, 3, 3)
+    k_y = k_x.transpose(-2, -1).contiguous()
 
-    rendered_map = rendered_edge * depth_norm
-    gt_map       = gt_edge * depth_norm
+    g    = gt_gray.view(1, 1, *gt_gray.shape)
+    gt_ex = F.conv2d(g, k_x, padding=1)[0, 0].abs()
+    gt_ey = F.conv2d(g, k_y, padding=1)[0, 0].abs()
 
-    return F.mse_loss(rendered_map, gt_map)
+    d    = depth_sq.view(1, 1, *depth_sq.shape)
+    d_ex = F.conv2d(d, k_x, padding=1)[0, 0].abs()
+    d_ey = F.conv2d(d, k_y, padding=1)[0, 0].abs()
+
+    return (d_ex * torch.exp(-gt_ex) + d_ey * torch.exp(-gt_ey)).mean()
