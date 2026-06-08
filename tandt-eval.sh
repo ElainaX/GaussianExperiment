@@ -1,6 +1,8 @@
-python train.py \
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
+
+TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/data/tandt/tandt/truck \
-    -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck \
+    -m $MODEL_DIR \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
     --env_scope_radius 1 \
@@ -18,8 +20,13 @@ python train.py \
     --fastgs_num_cams 10 \
     --lambda_lpips 0 \
     --lambda_edge_aware 0.1 \
-    --edge_aware_from_iter 10000
+    --edge_aware_from_iter 10000"
 
-python render.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
+eval $TRAIN_CMD
 
-python metrics.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
+mkdir -p $MODEL_DIR
+echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt
+
+python render.py -m $MODEL_DIR
+
+python metrics.py -m $MODEL_DIR
