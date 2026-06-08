@@ -142,6 +142,10 @@ class OptimizationParams(ParamGroup):
         self.fastgs_num_cams = 10             # 每次 score 计算采样的相机数量
         # [FASTGS END]
 
+        # [EDGE AWARE LOSS]
+        self.lambda_edge_aware = 0.0          # 边缘感知 loss 权重（0=关闭）
+        self.edge_aware_from_iter = 10000     # 从第几个 iter 开始施加
+
         self.gsrgb_loss = False
         self.init_until_iter = 0
         self.alpha_until_iter = -1

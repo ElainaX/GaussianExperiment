@@ -22,7 +22,7 @@ from tqdm import tqdm
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import *
 from scene import GaussianModel, Scene
-from utils.fast_utils import compute_gaussian_score_rtsplat  # [FASTGS]
+from utils.fast_utils import compute_gaussian_score_rtsplat, edge_aware_loss  # [FASTGS]
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
@@ -227,6 +227,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             loss += consistency_loss
             loss_dict['consistency'] = consistency_loss.item()
+
+        # === 边缘感知 loss：对齐渲染图与 GT 的「边缘×深度」分布 ===
+        if opt.lambda_edge_aware > 0 and iteration >= opt.edge_aware_from_iter:
+            ea_loss = opt.lambda_edge_aware * edge_aware_loss(
+                final_rendering, gt_image, render_pkg['surface_depth']
+            )
+            loss += ea_loss
+            loss_dict['edge_aware'] = ea_loss.item()
 
         # ------------------------------------------------------------------
         # 反向传播

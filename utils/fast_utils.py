@@ -124,3 +124,29 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, sk
         importance_score = None
 
     return importance_score, pruning_score, protection_score
+
+
+def edge_aware_loss(rendered, gt, depth):
+    """边缘感知 loss：对齐渲染图与 GT 图的「边缘强度 × 归一化深度」分布。
+
+    边缘强度由 Sobel 算子计算，深度作为空间权重让损失聚焦于有几何意义的边缘区域
+    （远景背景轮廓权重高，近景内部纹理权重低）。
+
+    Args:
+        rendered : [3, H, W] float，渲染图（需要梯度）
+        gt       : [3, H, W] float，GT 原图（no grad）
+        depth    : [1, H, W] 或 [H, W] float，渲染深度（detach 后用作权重）
+
+    Returns:
+        scalar loss（MSE）
+    """
+    depth = depth.squeeze().detach()
+    depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+
+    rendered_edge = _sobel_edge(rendered.mean(dim=0))        # [H, W]，有梯度
+    gt_edge       = _sobel_edge(gt.mean(dim=0).detach())     # [H, W]，无梯度
+
+    rendered_map = rendered_edge * depth_norm
+    gt_map       = gt_edge * depth_norm
+
+    return F.mse_loss(rendered_map, gt_map)

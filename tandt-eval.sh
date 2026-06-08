@@ -16,7 +16,9 @@ python train.py \
     --fastgs_loss_thresh 0.5 \
     --fastgs_min_importance 5 \
     --fastgs_num_cams 10 \
-    --lambda_lpips 0
+    --lambda_lpips 0 \
+    --lambda_edge_aware 0.1 \
+    --edge_aware_from_iter 10000
 
 python render.py -m ~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
 
