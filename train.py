@@ -57,10 +57,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    # 背景颜色：白色或黑色，影响渲染时的背景填充
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
-
     # CUDA Event 用于精确测量每次迭代的 GPU 耗时
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -228,10 +224,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += consistency_loss
             loss_dict['consistency'] = consistency_loss.item()
 
-        # === 深度边缘 loss：对齐 surface_depth 边缘与 GT 图像边缘 ===
+        # === 边缘感知 loss：对齐渲染图与 GT 的「边缘×深度」分布 ===
         if opt.lambda_edge_aware > 0 and iteration >= opt.edge_aware_from_iter:
             ea_loss = opt.lambda_edge_aware * edge_aware_loss(
-                render_pkg['surface_depth'], gt_image
+                final_rendering, gt_image, render_pkg['surface_depth']
             )
             loss += ea_loss
             loss_dict['edge_aware'] = ea_loss.item()
