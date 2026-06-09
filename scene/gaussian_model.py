@@ -413,6 +413,9 @@ class GaussianModel:
 
         torch.save(self.light_mlp, path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         torch.save(self.dir_encoding, path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
+        if self.refl_score is not None:
+            torch.save({'score': self.refl_score.cpu(), 'thresh': self._refl_thresh},
+                       path.split('point_cloud.ply')[0] + '/refl_score.pt')
 
     def reset_occupancy(self):
         self._occupancy.data[torch.isnan(self._occupancy.data.mean(dim=-1))] = 0.0
@@ -505,6 +508,11 @@ class GaussianModel:
 
         self.light_mlp = torch.load(path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
+        refl_path = path.split('point_cloud.ply')[0] + '/refl_score.pt'
+        if os.path.exists(refl_path):
+            saved = torch.load(refl_path, map_location='cuda')
+            self.refl_score   = saved['score'].cuda()
+            self._refl_thresh = saved['thresh']
         print('Load Path', path)
 
     def replace_tensor_to_optimizer(self, tensor, name):

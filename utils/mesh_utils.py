@@ -160,7 +160,8 @@ class GaussianExtractor(object):
                     )
                     executor.submit(save_img_u8, render_pkg['volume_dist'][0].cpu().numpy(), os.path.join(vis_path, 'volume_dist_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['volume_opacity'][0].cpu().numpy(), os.path.join(vis_path, 'volume_opacity_{0:05d}'.format(i) + '.png'))
-                    executor.submit(save_img_u8, render_pkg['refl_score'][0].cpu().numpy(), os.path.join(vis_path, 'refl_score_{0:05d}'.format(i) + '.png'))
+                    if render_pkg['refl_score'].any():  # 全零（未启用 refl_on）时跳过
+                        executor.submit(save_img_u8, render_pkg['refl_score'][0].cpu().numpy(), os.path.join(vis_path, 'refl_score_{0:05d}'.format(i) + '.png'))
 
     def estimate_bounding_sphere(self):
         """

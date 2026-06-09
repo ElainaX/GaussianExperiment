@@ -26,10 +26,11 @@ from utils.loss_utils import ssim
 lpips = LPIPS(net_type='vgg').cuda()
 
 
-def readImages(renders_dir, gt_dir, masks_dir):
+def readImages(renders_dir, gt_dir, masks_dir, vis_dir=None, refl_thresh=0.5):
     renders = []
     gts = []
     masks = []
+    refl_masks = []
     image_names = []
     for fname in sorted(os.listdir(renders_dir)):
         render = Image.open(renders_dir / fname)
@@ -40,7 +41,31 @@ def readImages(renders_dir, gt_dir, masks_dir):
         mask_tensor = tf.to_tensor(mask.convert('L')).unsqueeze(0).cuda()
         masks.append((mask_tensor > 0.5).float())
         image_names.append(fname)
-    return renders, gts, masks, image_names
+
+        # refl_score_XXXXX.png：uint8 灰度图，值域 [0,255] 对应分数 [0,1]
+        refl_mask = None
+        if vis_dir is not None:
+            stem = Path(fname).stem
+            refl_path = vis_dir / f'refl_score_{stem}.png'
+            if refl_path.exists():
+                score_img = tf.to_tensor(Image.open(refl_path).convert('L')).unsqueeze(0).cuda()
+                refl_mask = (score_img > refl_thresh).float()  # [1,1,H,W]
+        refl_masks.append(refl_mask)
+
+    return renders, gts, masks, refl_masks, image_names
+
+
+def psnr_region(render, gt, mask):
+    """只对 mask>0 的像素计算 PSNR，避免背景零值拉偏 MSE。"""
+    pixel_mask = mask[0, 0] > 0  # [H, W]
+    if not pixel_mask.any():
+        return None
+    r = render[0][:, pixel_mask]   # [3, N]
+    g = gt[0][:, pixel_mask]       # [3, N]
+    mse = ((r - g) ** 2).mean()
+    if mse == 0:
+        return torch.tensor(float('inf'))
+    return 20.0 * torch.log10(1.0 / torch.sqrt(mse))
 
 
 def evaluate(model_paths):
@@ -70,7 +95,12 @@ def evaluate(model_paths):
             gt_dir = method_dir / 'gt'
             renders_dir = method_dir / 'renders'
             masks_dir = method_dir / 'transparent_masks'
-            renders, gts, masks, image_names = readImages(renders_dir, gt_dir, masks_dir)
+            vis_dir = method_dir / 'vis'
+            renders, gts, masks, refl_masks, image_names = readImages(
+                renders_dir, gt_dir, masks_dir,
+                vis_dir=vis_dir if vis_dir.exists() else None,
+                refl_thresh=args.refl_thresh,
+            )
 
             ssims = []
             psnrs = []
@@ -121,6 +151,19 @@ def evaluate(model_paths):
                 }
             )
 
+            # Refl-region PSNR：只对反射分数 > refl_thresh 的像素区域计算
+            refl_psnrs = [psnr_region(renders[idx], gts[idx], refl_masks[idx])
+                          for idx in range(len(renders)) if refl_masks[idx] is not None]
+            if refl_psnrs:
+                refl_psnr_val = torch.stack(refl_psnrs).mean().item()
+                print('  Refl PSNR (thresh={:.2f}): {:>12.7f}'.format(args.refl_thresh, refl_psnr_val))
+                print('')
+                full_dict[scene_dir][method].update({'Refl PSNR': refl_psnr_val})
+                per_view_dict[scene_dir][method].update(
+                    {'Refl PSNR': {name: v.item() for v, name in zip(refl_psnrs, image_names)
+                                   if refl_masks[image_names.index(name)] is not None}}
+                )
+
         with open(scene_dir + '/results.json', 'w') as fp:
             json.dump(full_dict[scene_dir], fp, indent=True)
         with open(scene_dir + '/per_view.json', 'w') as fp:
@@ -134,5 +177,7 @@ if __name__ == '__main__':
     # Set up command line argument parser
     parser = ArgumentParser(description='Training script parameters')
     parser.add_argument('--model_paths', '-m', required=True, nargs='+', type=str, default=[])
+    parser.add_argument('--refl_thresh', type=float, default=0.5,
+                        help='反射分数阈值，与训练时 --refl_thresh 保持一致')
     args = parser.parse_args()
     evaluate(args.model_paths)

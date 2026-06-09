@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify_refl/truck
 
 TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/data/tandt/tandt/truck \
@@ -20,7 +20,15 @@ TRAIN_CMD="python train.py \
     --fastgs_num_cams 10 \
     --lambda_lpips 0 \
     --lambda_edge_aware 0.1 \
-    --edge_aware_from_iter 10000"
+    --edge_aware_from_iter 10000 \
+    --refl_on \
+    --refl_thresh 0.5 \
+    --refl_weight_e 0.25 \
+    --refl_weight_d 0.25 \
+    --refl_weight_s 0.25 \
+    --refl_weight_m 0.25 \
+    --refl_update_interval 1000 \
+    --refl_from_iter 5000"
 
 eval $TRAIN_CMD
 
