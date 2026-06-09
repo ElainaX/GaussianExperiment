@@ -126,6 +126,71 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, sk
     return importance_score, pruning_score, protection_score
 
 
+def _specular_score(img_chw):
+    """GT 图高亮+低饱和+高局部对比 → 高光区域分数 [H,W]，值域 [0,1]。"""
+    R, G, B = img_chw[0], img_chw[1], img_chw[2]
+    L = 0.299 * R + 0.587 * G + 0.114 * B                          # 亮度
+    max_c = img_chw.max(dim=0).values
+    min_c = img_chw.min(dim=0).values
+    sat = (max_c - min_c) / (max_c + 1e-6)                         # 饱和度
+    L4 = L[None, None]
+    local_mean = F.avg_pool2d(L4, 7, stride=1, padding=3)[0, 0]
+    local_sq   = F.avg_pool2d(L4 ** 2, 7, stride=1, padding=3)[0, 0]
+    contrast   = (local_sq - local_mean ** 2).clamp(min=0).sqrt()  # 局部对比度
+    score = L * (1 - sat) * contrast
+    return score / (score.max() + 1e-6)
+
+
+def compute_reflection_score(viewpoint_stack, gaussians, pipe, bg, opt):
+    """计算每个高斯的反射潜力分数，用于动态扩展 inside_mask。
+
+    R(p) = w_e*E(p) + w_d*D(p) + w_s*S(p) + w_m*M(p)
+      E(p): GT 图边缘强度（Sobel）
+      D(p): 归一化深度（远处背景轮廓权重高）
+      S(p): GT 图高亮+低饱和+高局部对比（高光区域）
+      M(p): 光度误差 × GT 亮度（模型未能捕捉的高光残差）
+
+    R(p) 通过 surface pass 的 σ 加权 atomicAdd 聚合到每个高斯上，
+    最终归一化到 [0,1]。
+
+    Returns:
+        refl_score: [N] float tensor，值域 [0,1]
+    """
+    camlist = _sample_cameras(viewpoint_stack, opt.fastgs_num_cams)
+    full_refl = None
+
+    with torch.no_grad():
+        for cam in camlist:
+            pkg    = render(cam, gaussians, pipe, bg)
+            rendered = pkg['final_rendering']
+            depth    = pkg['surface_depth'].squeeze()
+            gt       = cam.original_image.cuda()
+
+            E = _sobel_edge(gt.mean(dim=0))                                   # [H,W]
+            depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+            D = depth_norm                                                     # 远=1
+            S = _specular_score(gt)                                            # [H,W]
+            L_gt = gt.mean(dim=0)
+            err  = torch.abs(rendered - gt).mean(dim=0)
+            M    = err * L_gt
+            M    = M / (M.max() + 1e-6)
+
+            R = (opt.refl_weight_e * E + opt.refl_weight_d * D +
+                 opt.refl_weight_s * S + opt.refl_weight_m * M)
+            R = R / (R.max() + 1e-6)
+
+            # 第二次渲染：用 σ 加权 atomicAdd 将 R(p) 聚合到每个高斯
+            pkg2      = render(cam, gaussians, pipe, bg, protection_map=R.flatten())
+            accum_r   = pkg2['accum_protection']  # [N]
+            full_refl = accum_r.clone() if full_refl is None else full_refl + accum_r
+
+    if full_refl is None:
+        return torch.zeros(gaussians.get_xyz.shape[0], device='cuda')
+
+    lo, hi = full_refl.min(), full_refl.max()
+    return (full_refl - lo) / (hi - lo + 1e-6)
+
+
 def edge_aware_loss(rendered, gt, depth):
     """边缘感知 loss：对齐渲染图与 GT 图的「边缘强度 × 归一化深度」分布。
 

@@ -146,6 +146,16 @@ class OptimizationParams(ParamGroup):
         self.lambda_edge_aware = 0.0          # 边缘感知 loss 权重（0=关闭）
         self.edge_aware_from_iter = 10000     # 从第几个 iter 开始施加
 
+        # [REFLECTION SCORE] 动态扩展 inside_mask 的反射分数机制
+        self.refl_on = False                  # 总开关
+        self.refl_thresh = 0.5               # 高斯纳入反射范围的分数阈值
+        self.refl_weight_e = 0.25            # E(p) 边缘权重
+        self.refl_weight_d = 0.25            # D(p) 深度权重
+        self.refl_weight_s = 0.25            # S(p) 高光权重
+        self.refl_weight_m = 0.25            # M(p) 光度残差权重
+        self.refl_update_interval = 1000     # 每隔多少 iter 重新计算一次分数
+        self.refl_from_iter = 5000           # 从第几个 iter 开始启用
+
         self.gsrgb_loss = False
         self.init_until_iter = 0
         self.alpha_until_iter = -1

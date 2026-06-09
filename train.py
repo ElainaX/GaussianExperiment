@@ -22,7 +22,7 @@ from tqdm import tqdm
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import *
 from scene import GaussianModel, Scene
-from utils.fast_utils import compute_gaussian_score_rtsplat, edge_aware_loss  # [FASTGS]
+from utils.fast_utils import compute_gaussian_score_rtsplat, compute_reflection_score, edge_aware_loss  # [FASTGS]
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
@@ -305,6 +305,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 在 reset_occupancy 的中间点 reset opacity（标准 3DGS 的做法，与 occupancy 机制配合）
                 if iteration >= opt.occupancy_reset_interval and iteration % opt.occupancy_reset_interval == opt.occupancy_reset_interval // 2:
                     gaussians.reset_opacity()
+
+            # [REFLECTION SCORE] 周期性更新每个高斯的反射分数，动态扩展 inside_mask
+            if (opt.refl_on
+                    and iteration >= opt.refl_from_iter
+                    and iteration % opt.refl_update_interval == 0):
+                refl_score = compute_reflection_score(
+                    scene.getTrainCameras(), gaussians, pipe, bg, opt
+                )
+                gaussians.set_refl_score(refl_score, opt.refl_thresh)
 
             # =========================================================
             # 阶段⑤：参数更新

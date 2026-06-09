@@ -104,6 +104,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._occupancy = torch.empty(0)
+        self.refl_score  = None   # [N] float，None 表示未计算；shape 变化后自动失效
+        self._refl_thresh = None  # 与 refl_score 同步存储的阈值
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.xyz_gradient_accum_abs = torch.empty(0)  # [FASTGS] 尺寸梯度（scaling.grad）累积
@@ -198,6 +200,31 @@ class GaussianModel:
     @property
     def get_inside_mask(self):
         return torch.sum((self.get_xyz - self.ENV_CENTER) ** 2, dim=-1, keepdim=True) < self.ENV_RADIUS**2
+
+    def set_refl_score(self, score, thresh):
+        """更新反射分数和对应阈值。score shape 不匹配时自动丢弃。"""
+        if score is not None and score.shape[0] == self._xyz.shape[0]:
+            self.refl_score   = score.detach()
+            self._refl_thresh = thresh
+        else:
+            self.refl_score   = None
+            self._refl_thresh = None
+
+    def get_effective_inside_mask(self):
+        """基础 inside_mask | 高反射分数高斯，返回 [N,1] float。"""
+        base = self.get_inside_mask.float()
+        if (self.refl_score is None or self._refl_thresh is None
+                or self.refl_score.shape[0] != self._xyz.shape[0]):
+            return base
+        extended = (self.refl_score.unsqueeze(1) > self._refl_thresh)
+        return (base.bool() | extended).float()
+
+    @property
+    def get_refl_score_vis(self):
+        """per-Gaussian 反射分数可视化通道 [N,1]，未计算时返回全零。"""
+        if self.refl_score is None or self.refl_score.shape[0] != self._xyz.shape[0]:
+            return torch.zeros(self._xyz.shape[0], 1, device='cuda')
+        return self.refl_score.unsqueeze(1).clamp(0, 1)
 
     @property
     def get_roughness(self):
