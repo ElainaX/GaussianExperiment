@@ -98,11 +98,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     # Deferred pass
 
-    eff_mask = pc.get_effective_inside_mask()  # [N,1] float，基础 mask | 高反射分数高斯
+    inside_mask = pc.get_inside_mask.float()
     extras = torch.cat([pc.get_roughness, pc.get_language_feature,
-                        eff_mask, eff_mask * pc.get_reflectance,
-                        opacity, eff_mask * pc.get_transmissivity,
-                        pc.get_refl_score_vis], dim=-1)
+                        inside_mask, inside_mask * pc.get_reflectance,
+                        opacity, inside_mask * pc.get_transmissivity], dim=-1)
 
     # [FASTGS] surface pass：metric_map 用于高误差计数，protection_map 用于边缘保护分
     render_scat, surface_extras, radii, surface_allmap, accum_metric_counts, accum_protection = rasterizer(
@@ -118,7 +117,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         protection_map=protection_map,
     )
 
-    render_roughness, render_feature, foreground, render_reflectance, surface_opacity, render_transmissivity, render_refl_score = surface_extras.split([1, 4, 1, 1, 1, 1, 1], dim=0)
+    render_roughness, render_feature, foreground, render_reflectance, surface_opacity, render_transmissivity = surface_extras.split([1, 4, 1, 1, 1, 1], dim=0)
+
     foreground = foreground.detach()
 
     surface_alpha = surface_allmap[1:2]
@@ -231,7 +231,6 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         'radii': radii,
         'accum_metric_counts': accum_metric_counts,  # [FASTGS] per-Gaussian 高误差像素覆盖计数
         'accum_protection': accum_protection,         # [FASTGS] per-Gaussian alpha加权边缘保护分
-        'refl_score': render_refl_score,              # [REFL] per-pixel 反射分数可视化图
     }
 
     return rets
