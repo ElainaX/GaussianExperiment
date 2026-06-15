@@ -18,7 +18,7 @@ def _sobel_edge(img_gray_hw):
     g = img_gray_hw.view(1,1,*img_gray_hw.shape)
     ex = F.conv2d(g, k_x, padding=1)[0,0]
     ey = F.conv2d(g, k_y, padding=1)[0,0]
-    edge = torch.sqrt(ex**2 + ey**2)
+    edge = torch.sqrt(ex**2 + ey**2 + 1e-8)  # epsilon inside sqrt prevents NaN gradient at flat regions
     return edge / (edge.max() + 1e-6)
 
 
@@ -140,7 +140,7 @@ def edge_aware_loss(rendered, gt, depth):
     Returns:
         scalar loss（MSE）
     """
-    depth = depth.squeeze().detach()
+    depth = torch.nan_to_num(depth.squeeze().detach(), nan=0.0, posinf=0.0, neginf=0.0)
     depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
 
     rendered_edge = _sobel_edge(rendered.mean(dim=0))        # [H, W]，有梯度

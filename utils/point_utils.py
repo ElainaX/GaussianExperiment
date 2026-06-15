@@ -65,6 +65,6 @@ def depth_to_normal_sobel(view, depth):
     dx = grad_x_channels.permute(0, 2, 3, 1)
     dy = grad_y_channels.permute(0, 2, 3, 1)
 
-    normal_map = torch.nn.functional.normalize(torch.cross(dy, dx, dim=-1), dim=-1)
+    normal_map = torch.nn.functional.normalize(torch.cross(dy, dx, dim=-1), dim=-1, eps=1e-8)
 
     return normal_map if is_batch else normal_map.squeeze(0)

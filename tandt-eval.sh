@@ -5,7 +5,7 @@ TRAIN_CMD="python train.py \
     -m $MODEL_DIR \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
-    --env_scope_radius 0 \
+    --env_scope_radius 1000.0 \
     --init_until_iter 700 \
     --norm_loss_from_iter 700 \
     --xyz_axis 2.0 1.0 0.0 \
