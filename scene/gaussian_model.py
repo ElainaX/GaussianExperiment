@@ -96,7 +96,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
     def __init__(self, sh_degree: int, args):
-        self.active_sh_degree = 0
+        self.active_sh_degree = 1  # start at degree 1; per-Gaussian masking in get_features controls individual degrees
         self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
@@ -117,6 +117,12 @@ class GaussianModel:
         self._roughness = torch.empty(0)
         self._opacity = torch.empty(0)
         self._transmissivity = torch.empty(0)
+
+        # [HIGH-REFL] per-Gaussian high-reflection detection state (not learned, not in optimizer)
+        self._ending = torch.empty(0)               # accumulated count of views where this Gaussian terminated alpha
+        self._passthrough_count = torch.empty(0)   # accumulated count of views that passed through an ending Gaussian
+        self._per_gaussian_sh_degree = torch.empty(0, dtype=torch.long)  # individual SH degree cap per Gaussian (1-3)
+        self._is_high_reflection = torch.empty(0, dtype=torch.bool)      # True if promoted to high-reflection
 
         if args.env_scope_radius > 0:
             self.ENV_CENTER = torch.tensor([float(c) for c in args.env_scope_center], device='cuda')
@@ -221,9 +227,17 @@ class GaussianModel:
 
     @property
     def get_features(self):
-        features_dc = self._features_dc
-        features_rest = self._features_rest
-        return torch.cat((features_dc, features_rest), dim=1)
+        features_dc = self._features_dc   # [N, 1, 3]
+        features_rest = self._features_rest  # [N, num_rest, 3]
+        _, num_rest, _ = features_rest.shape
+        # Build per-Gaussian SH degree mask: zero out coefficients above individual degree.
+        # rest layout: indices 0-2 = degree 1, 3-7 = degree 2, 8-14 = degree 3
+        cutoff_table = torch.tensor([0, 3, 8, 15], device=features_rest.device)
+        deg = self._per_gaussian_sh_degree.clamp(0, 3)
+        per_cutoff = cutoff_table[deg]  # [N] number of active rest coefficients
+        idx = torch.arange(num_rest, device=features_rest.device).unsqueeze(0)  # [1, num_rest]
+        sh_mask = (idx < per_cutoff.unsqueeze(1)).to(features_rest.dtype).unsqueeze(-1)  # [N, num_rest, 1]
+        return torch.cat((features_dc, features_rest * sh_mask), dim=1)
 
     @property
     def get_occupancy(self):
@@ -271,6 +285,13 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._transmissivity = nn.Parameter(transmissivities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device='cuda')
+
+        # [HIGH-REFL] non-learned per-Gaussian state
+        N = fused_point_cloud.shape[0]
+        self._ending = torch.zeros(N, device='cuda')
+        self._passthrough_count = torch.zeros(N, device='cuda')
+        self._per_gaussian_sh_degree = torch.ones(N, dtype=torch.long, device='cuda')
+        self._is_high_reflection = torch.zeros(N, dtype=torch.bool, device='cuda')
 
         self._roughness = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
         self._reflectance = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
@@ -355,6 +376,9 @@ class GaussianModel:
         for i in range(self._language_feature.shape[1]):
             l.append('feature_{}'.format(i))
 
+        l.append('per_sh_degree')
+        l.append('is_high_reflection')
+
         return l
 
     def save_ply(self, path):
@@ -376,10 +400,13 @@ class GaussianModel:
 
         language_feature = self._language_feature.detach().cpu().numpy()
 
+        per_sh_degree = self._per_gaussian_sh_degree.cpu().numpy().reshape(-1, 1).astype(np.float32)
+        is_high_reflection = self._is_high_reflection.cpu().numpy().reshape(-1, 1).astype(np.float32)
+
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature), axis=1)
+        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature, per_sh_degree, is_high_reflection), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -476,6 +503,19 @@ class GaussianModel:
         self.active_sh_degree = self.max_sh_degree
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device='cuda')
 
+        # [HIGH-REFL] load per-Gaussian state (graceful fallback for old PLY files)
+        N = xyz.shape[0]
+        try:
+            sh_deg = np.asarray(plydata.elements[0]['per_sh_degree']).astype(np.int64)
+            self._per_gaussian_sh_degree = torch.tensor(sh_deg, dtype=torch.long, device='cuda')
+            is_hr = np.asarray(plydata.elements[0]['is_high_reflection']).astype(bool)
+            self._is_high_reflection = torch.tensor(is_hr, dtype=torch.bool, device='cuda')
+        except Exception:
+            self._per_gaussian_sh_degree = torch.ones(N, dtype=torch.long, device='cuda')
+            self._is_high_reflection = torch.zeros(N, dtype=torch.bool, device='cuda')
+        self._ending = torch.zeros(N, device='cuda')
+        self._passthrough_count = torch.zeros(N, device='cuda')
+
         self.light_mlp = torch.load(path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
         print('Load Path', path)
@@ -543,6 +583,12 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.last_update = self.last_update[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+        # [HIGH-REFL]
+        self._ending = self._ending[valid_points_mask]
+        self._passthrough_count = self._passthrough_count[valid_points_mask]
+        self._per_gaussian_sh_degree = self._per_gaussian_sh_degree[valid_points_mask]
+        self._is_high_reflection = self._is_high_reflection[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -632,9 +678,20 @@ class GaussianModel:
 
         new_language_feature = self._language_feature[selected_pts_mask].repeat(N, 1)
 
+        # [HIGH-REFL] save parent values before postfix changes tensor sizes
+        _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].repeat(N)
+        _new_is_hr = self._is_high_reflection[selected_pts_mask].repeat(N)
+        _n_new = N * selected_pts_mask.sum()
+
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask].repeat(N, 1)), dim=0)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancy, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+        # [HIGH-REFL] extend non-learned tensors before prune removes the originals
+        self._ending = torch.cat([self._ending, torch.zeros(_n_new, device='cuda')])
+        self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
+        self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
+        self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
@@ -658,9 +715,20 @@ class GaussianModel:
 
         new_language_feature = self._language_feature[selected_pts_mask]
 
+        # [HIGH-REFL] save parent values before postfix changes tensor sizes
+        _n_new = selected_pts_mask.sum()
+        _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].clone()
+        _new_is_hr = self._is_high_reflection[selected_pts_mask].clone()
+
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask]), dim=0)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancies, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+        # [HIGH-REFL] extend non-learned tensors for cloned Gaussians (reset tracking counters)
+        self._ending = torch.cat([self._ending, torch.zeros(_n_new, device='cuda')])
+        self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
+        self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
+        self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
 
     # [FASTGS BEGIN] ──────────────────────────────────────────────────────────
     # 多视角一致性引导的 densification/pruning 方法
@@ -684,8 +752,19 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask]
         new_language_feature = self._language_feature[selected_pts_mask]
 
+        # [HIGH-REFL] save parent values before postfix changes tensor sizes
+        _n_new = selected_pts_mask.sum()
+        _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].clone()
+        _new_is_hr = self._is_high_reflection[selected_pts_mask].clone()
+
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask]), dim=0)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancies, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+        # [HIGH-REFL] extend non-learned tensors for cloned Gaussians
+        self._ending = torch.cat([self._ending, torch.zeros(_n_new, device='cuda')])
+        self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
+        self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
+        self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
 
     def densify_and_split_fastgs(self, metric_mask, all_splits, N=2):
         """分裂满足条件的高斯：尺寸大 + 尺寸梯度大 + 多视角认证重建差"""
@@ -716,8 +795,19 @@ class GaussianModel:
         new_roughness = self._roughness[selected_pts_mask].repeat(N, 1)
         new_language_feature = self._language_feature[selected_pts_mask].repeat(N, 1)
 
+        # [HIGH-REFL] save parent values before postfix changes tensor sizes
+        _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].repeat(N)
+        _new_is_hr = self._is_high_reflection[selected_pts_mask].repeat(N)
+        _n_new = N * selected_pts_mask.sum()
+
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask].repeat(N, 1)), dim=0)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancy, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
+
+        # [HIGH-REFL] extend non-learned tensors before prune removes the originals
+        self._ending = torch.cat([self._ending, torch.zeros(_n_new, device='cuda')])
+        self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
+        self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
+        self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
@@ -816,6 +906,41 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     # [FASTGS END] ────────────────────────────────────────────────────────────
+
+    # [HIGH-REFL] ──────────────────────────────────────────────────────────────
+    def update_high_reflection_gaussians(self, passthrough_thresh=3, reflectance_boost=1.0, roughness_reduction=0.5):
+        """检查 ending 高斯中被其他相机"穿越"的高斯，升级其 SH 阶数并标记为高反射。
+
+        条件：该高斯至少在一个视角中终止了 alpha 合成（_ending > 0），
+              同时在其他视角中被射线穿过而未终止（_passthrough_count >= passthrough_thresh）。
+        效果：
+          - _per_gaussian_sh_degree += 1（最高 3 阶）
+          - _is_high_reflection = True
+          - 直接调高 _reflectance 原始 logit（更强反射）
+          - 降低 _roughness 原始 logit（更光滑/更镜面）
+          - 重置 _passthrough_count（防止立刻再次升级）
+          - 更新 active_sh_degree = max(_per_gaussian_sh_degree)
+        """
+        with torch.no_grad():
+            promote_mask = (self._ending > 0) & (self._passthrough_count >= passthrough_thresh) \
+                           & (self._per_gaussian_sh_degree < self.max_sh_degree)
+
+            if promote_mask.any():
+                self._per_gaussian_sh_degree[promote_mask] = (
+                    self._per_gaussian_sh_degree[promote_mask] + 1
+                ).clamp(max=self.max_sh_degree)
+                self._is_high_reflection[promote_mask] = True
+                self._reflectance.data[promote_mask] += reflectance_boost
+                self._roughness.data[promote_mask] -= roughness_reduction
+                self._passthrough_count[promote_mask] = 0
+
+                n_promoted = promote_mask.sum().item()
+                n_hr = self._is_high_reflection.sum().item()
+                print(f'[HIGH-REFL] promoted {n_promoted} Gaussians '
+                      f'(total high-reflection: {n_hr})')
+
+            self.active_sh_degree = int(self._per_gaussian_sh_degree.max().item())
+    # ──────────────────────────────────────────────────────────────────────────
 
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         grads = self.xyz_gradient_accum / self.denom
