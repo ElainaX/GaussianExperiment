@@ -908,31 +908,29 @@ class GaussianModel:
     # [FASTGS END] ────────────────────────────────────────────────────────────
 
     # [HIGH-REFL] ──────────────────────────────────────────────────────────────
-    def update_high_reflection_gaussians(self, passthrough_thresh=3, reflectance_boost=1.0, roughness_reduction=0.5):
-        """检查 ending 高斯中被其他相机"穿越"的高斯，升级其 SH 阶数并标记为高反射。
+    def update_high_reflection_gaussians(self, num_cameras, reflectance_boost=1.0, roughness_reduction=0.5):
+        """检查 ending 高斯中被其他相机"穿越"的高斯，升级其 SH 阶数。
 
-        条件：该高斯至少在一个视角中终止了 alpha 合成（_ending > 0），
-              同时在其他视角中被射线穿过而未终止（_passthrough_count >= passthrough_thresh）。
-        效果：
-          - _per_gaussian_sh_degree += 1（最高 3 阶）
-          - _is_high_reflection = True
-          - 直接调高 _reflectance 原始 logit（更强反射）
-          - 降低 _roughness 原始 logit（更光滑/更镜面）
-          - 重置 _passthrough_count（防止立刻再次升级）
-          - 更新 active_sh_degree = max(_per_gaussian_sh_degree)
+        条件：_ending > 0 且 _passthrough_count >= num_cameras（累计穿越次数超过一轮相机数）。
+        每满足一次条件升一阶（1→2→3），达到 3 阶才标记为 high_reflection 并调整材质参数。
+        升级后重置 _passthrough_count，下一阶需要再累计满 num_cameras 次才能继续升。
         """
         with torch.no_grad():
-            promote_mask = (self._ending > 0) & (self._passthrough_count >= passthrough_thresh) \
+            promote_mask = (self._ending > 0) & (self._passthrough_count >= num_cameras) \
                            & (self._per_gaussian_sh_degree < self.max_sh_degree)
 
             if promote_mask.any():
                 self._per_gaussian_sh_degree[promote_mask] = (
                     self._per_gaussian_sh_degree[promote_mask] + 1
                 ).clamp(max=self.max_sh_degree)
-                self._is_high_reflection[promote_mask] = True
-                self._reflectance.data[promote_mask] += reflectance_boost
-                self._roughness.data[promote_mask] -= roughness_reduction
-                self._passthrough_count[promote_mask] = 0
+                self._passthrough_count[promote_mask] = 0  # reset for next level
+
+                # 只有升到 max_sh_degree（3 阶）才标记 high_reflection 并调整材质
+                just_reached_max = promote_mask & (self._per_gaussian_sh_degree == self.max_sh_degree)
+                if just_reached_max.any():
+                    self._is_high_reflection[just_reached_max] = True
+                    self._reflectance.data[just_reached_max] += reflectance_boost
+                    self._roughness.data[just_reached_max] -= roughness_reduction
 
                 n_promoted = promote_mask.sum().item()
                 n_hr = self._is_high_reflection.sum().item()

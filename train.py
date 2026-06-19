@@ -271,9 +271,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians._passthrough_count[_is_passthrough] += 1
 
             # 每 500 iter 检查并升级 high-reflection 高斯
+            # 阈值 = 训练相机总数：passthrough_count 累计超过一整轮相机才升一阶
             if iteration % 500 == 0 and iteration > 0:
                 gaussians.update_high_reflection_gaussians(
-                    passthrough_thresh=3,
+                    num_cameras=len(viewpoint_stack),
                     reflectance_boost=1.0,
                     roughness_reduction=0.5,
                 )
