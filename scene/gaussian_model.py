@@ -909,33 +909,57 @@ class GaussianModel:
 
     # [HIGH-REFL] ──────────────────────────────────────────────────────────────
     def update_high_reflection_gaussians(self, num_cameras, reflectance_boost=1.0, roughness_reduction=0.5):
-        """检查 ending 高斯中被其他相机"穿越"的高斯，升级其 SH 阶数。
+        """窗口式 SH 阶数管理：每次调用对应一个统计窗口（500 iter）。
 
-        条件：_ending > 0 且 _passthrough_count >= num_cameras（累计穿越次数超过一轮相机数）。
-        每满足一次条件升一阶（1→2→3），达到 3 阶才标记为 high_reflection 并调整材质参数。
-        升级后重置 _passthrough_count，下一阶需要再累计满 num_cameras 次才能继续升。
+        _ending 记录本窗口内该高斯终止过 alpha 的帧数，窗口结束后重置。
+        _passthrough_count 记录本窗口内ending高斯被穿越的帧数，升阶后重置。
+
+        降阶（先检查）：degree > 1 且本窗口 _ending == 0
+            → 本窗口完全没有终止任何相机的 alpha，高阶 SH 无意义
+            → degree -= 1；若从 3 降到 2，取消 is_high_reflection
+
+        升阶（后检查）：_ending > 0 且 _passthrough_count >= num_cameras 且 degree < max
+            → 视角相关性强，需要更高阶 SH
+            → degree += 1；升到 3 时标记 is_high_reflection 并调整材质参数
+            → 重置 _passthrough_count，下一阶需重新累计
+
+        两项检查完毕后重置 _ending = 0，开始新窗口。
         """
         with torch.no_grad():
+            # ── 降阶 ──────────────────────────────────────────────────────────
+            demote_mask = (self._per_gaussian_sh_degree > 1) & (self._ending == 0)
+            if demote_mask.any():
+                self._per_gaussian_sh_degree[demote_mask] = (
+                    self._per_gaussian_sh_degree[demote_mask] - 1
+                ).clamp(min=1)
+                # 从 3 阶降下来的取消 high_reflection 标记（材质参数让优化器自行修正）
+                lost_max = demote_mask & (self._per_gaussian_sh_degree < self.max_sh_degree)
+                self._is_high_reflection[lost_max] = False
+                self._passthrough_count[demote_mask] = 0  # 重置，从新阶数重新累计
+
+                print(f'[HIGH-REFL] demoted  {demote_mask.sum().item()} Gaussians')
+
+            # ── 升阶 ──────────────────────────────────────────────────────────
             promote_mask = (self._ending > 0) & (self._passthrough_count >= num_cameras) \
                            & (self._per_gaussian_sh_degree < self.max_sh_degree)
-
             if promote_mask.any():
                 self._per_gaussian_sh_degree[promote_mask] = (
                     self._per_gaussian_sh_degree[promote_mask] + 1
                 ).clamp(max=self.max_sh_degree)
-                self._passthrough_count[promote_mask] = 0  # reset for next level
+                self._passthrough_count[promote_mask] = 0
 
-                # 只有升到 max_sh_degree（3 阶）才标记 high_reflection 并调整材质
                 just_reached_max = promote_mask & (self._per_gaussian_sh_degree == self.max_sh_degree)
                 if just_reached_max.any():
                     self._is_high_reflection[just_reached_max] = True
                     self._reflectance.data[just_reached_max] += reflectance_boost
                     self._roughness.data[just_reached_max] -= roughness_reduction
 
-                n_promoted = promote_mask.sum().item()
                 n_hr = self._is_high_reflection.sum().item()
-                print(f'[HIGH-REFL] promoted {n_promoted} Gaussians '
+                print(f'[HIGH-REFL] promoted {promote_mask.sum().item()} Gaussians '
                       f'(total high-reflection: {n_hr})')
+
+            # ── 窗口重置 ──────────────────────────────────────────────────────
+            self._ending.zero_()  # 清空，开始下一个 500-iter 窗口
 
             self.active_sh_degree = int(self._per_gaussian_sh_degree.max().item())
     # ──────────────────────────────────────────────────────────────────────────

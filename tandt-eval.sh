@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/fastgsV2_prune_protect_stddensify/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/sh3/truck
 
 TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/data/tandt/tandt/truck \
