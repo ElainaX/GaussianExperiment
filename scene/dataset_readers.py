@@ -45,6 +45,9 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    prior_depth_path: str = None
+    prior_normal_path: str = None
+    prior_roughness_path: str = None
 
 
 class SceneInfo(NamedTuple):
@@ -79,7 +82,58 @@ def getNerfppNorm(cam_info):
     return {'translate': translate, 'radius': radius}
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+PRIOR_MODALITIES = ('depth', 'normal', 'roughness')
+
+
+def find_image_priors(prior_path, image_path):
+    """Locate optional material priors corresponding to an RGB image.
+
+    Supported layouts are:
+      <prior_path>/<image_stem>.<modality>.png
+      <prior_path>/<modality>/<image_stem>.png
+
+    A trailing ``.rgb`` in the source image stem is ignored so that both
+    ``0000.0000.png`` and ``0000.0000.rgb.png`` match the generated files.
+    """
+    paths = {modality: None for modality in PRIOR_MODALITIES}
+    if not prior_path:
+        return paths
+
+    prior_root = Path(prior_path)
+    image_stem = Path(image_path).stem
+    stems = [image_stem]
+    if image_stem.endswith('.rgb'):
+        stems.insert(0, image_stem[:-4])
+
+    for modality in PRIOR_MODALITIES:
+        candidates = []
+        for stem in stems:
+            candidates.extend(
+                [
+                    prior_root / f'{stem}.{modality}.png',
+                    prior_root / modality / f'{stem}.png',
+                ]
+            )
+        paths[modality] = next((str(path) for path in candidates if path.is_file()), None)
+    return paths
+
+
+def _print_prior_summary(cam_infos, prior_path):
+    if not prior_path:
+        return
+
+    counts = {
+        modality: sum(getattr(cam, f'prior_{modality}_path') is not None for cam in cam_infos)
+        for modality in PRIOR_MODALITIES
+    }
+    total = len(cam_infos)
+    summary = ', '.join(f'{name}={count}/{total}' for name, count in counts.items())
+    print(f'Loaded image prior paths from {prior_path}: {summary}')
+    if any(count != total for count in counts.values()):
+        print('[Warning] Some RGB images do not have a complete depth/normal/roughness prior set.')
+
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, prior_path=None):
     scene_root = os.path.dirname(images_folder)
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -110,16 +164,33 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             assert False, 'Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!'
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split('.')[0]
+        image_name = Path(image_path).stem
 
         image = Image.open(image_path)
+        prior_paths = find_image_priors(prior_path, image_path)
         transparent_mask_path = os.path.join(scene_root, 'transparent_masks', os.path.splitext(os.path.basename(extr.name))[0] + '.png')
         transparent_mask = Image.open(transparent_mask_path)
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, transparent_mask=transparent_mask, image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_info = CameraInfo(
+            uid=uid,
+            R=R,
+            T=T,
+            FovY=FovY,
+            FovX=FovX,
+            image=image,
+            transparent_mask=transparent_mask,
+            image_path=image_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+            prior_depth_path=prior_paths['depth'],
+            prior_normal_path=prior_paths['normal'],
+            prior_roughness_path=prior_paths['roughness'],
+        )
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
+    _print_prior_summary(cam_infos, prior_path)
     return cam_infos
 
 
@@ -155,7 +226,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, prior_path=None, llffhold=8):
 
     # llffhold = 2
 
@@ -171,7 +242,14 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = 'images' if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    if prior_path and not os.path.isdir(prior_path):
+        raise FileNotFoundError(f'Image prior directory does not exist: {prior_path}')
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        prior_path=prior_path,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval:
@@ -202,7 +280,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     return scene_info
 
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension='.png'):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension='.png', prior_path=None):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -235,6 +313,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
+            prior_paths = find_image_priors(prior_path, image_path)
 
             mask_path = os.path.join(path, frame['file_path'] + '_alpha' + extension)
             if os.path.exists(mask_path):
@@ -266,21 +345,28 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     FovY=FovY,
                     FovX=FovX,
                     image=image,
+                    transparent_mask=Image.new('L', image.size, 0),
                     image_path=image_path,
                     image_name=image_name,
                     width=image.size[0],
                     height=image.size[1],
+                    prior_depth_path=prior_paths['depth'],
+                    prior_normal_path=prior_paths['normal'],
+                    prior_roughness_path=prior_paths['roughness'],
                 )
             )
 
+    _print_prior_summary(cam_infos, prior_path)
     return cam_infos
 
 
-def readNerfSyntheticInfo(path, white_background, eval, extension='.png'):
+def readNerfSyntheticInfo(path, white_background, eval, prior_path=None, extension='.png'):
+    if prior_path and not os.path.isdir(prior_path):
+        raise FileNotFoundError(f'Image prior directory does not exist: {prior_path}')
     print('Reading Training Transforms')
-    train_cam_infos = readCamerasFromTransforms(path, 'transforms_train.json', white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, 'transforms_train.json', white_background, extension, prior_path)
     print('Reading Test Transforms')
-    test_cam_infos = readCamerasFromTransforms(path, 'transforms_test.json', white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(path, 'transforms_test.json', white_background, extension, prior_path)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self._source_path = ''
         self._model_path = ''
         self._images = 'images'
+        self.prior_path = ''
         self._resolution = -1
         self._white_background = False
         self.data_device = 'cuda'
@@ -73,6 +74,8 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if g.prior_path:
+            g.prior_path = os.path.abspath(os.path.expanduser(g.prior_path))
         return g
 
 

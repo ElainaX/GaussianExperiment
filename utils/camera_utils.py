@@ -79,6 +79,9 @@ def loadCam(args, id, cam_info, resolution_scale):
         image_name=cam_info.image_name,
         uid=id,
         data_device=args.data_device,
+        prior_depth_path=cam_info.prior_depth_path,
+        prior_normal_path=cam_info.prior_normal_path,
+        prior_roughness_path=cam_info.prior_roughness_path,
     )
 
 
