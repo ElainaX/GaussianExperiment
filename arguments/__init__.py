@@ -64,6 +64,9 @@ class ModelParams(ParamGroup):
 
         self.run_dim = 256
         self.rand_init = False
+        # Extra specular gain driven by the per-Gaussian glossy prior score.
+        # A score of zero preserves the original RT-Splatting rendering.
+        self.glossy_specular_boost = 1.0
 
         self.env_scope_center = [0.0, 0.0, 0.0]
         self.env_scope_radius = 0.0
@@ -148,6 +151,25 @@ class OptimizationParams(ParamGroup):
         # [EDGE AWARE LOSS]
         self.lambda_edge_aware = 0.0          # 边缘感知 loss 权重（0=关闭）
         self.edge_aware_from_iter = 10000     # 从第几个 iter 开始施加
+
+        # [GLOSSY PRIOR] 2D material priors -> alpha-weighted Gaussian scores.
+        self.glossy_prior_on = False
+        self.glossy_from_iter = 5000
+        self.glossy_interval = 500
+        self.glossy_num_cams = 8
+        self.glossy_min_views = 3
+        self.glossy_min_accum_weight = 1e-3
+        self.glossy_ema = 0.8
+        self.glossy_threshold = 0.15
+        self.glossy_roughness_power = 2.0
+        self.glossy_wavelet_levels = 2
+        self.glossy_wavelet_power = 1.0
+        self.glossy_highlight_power = 1.0
+        self.glossy_geometry_suppression = 2.0
+        self.glossy_color_var_scale = 20.0
+        self.glossy_color_floor = 0.35
+        self.glossy_target_roughness = 0.15
+        self.glossy_target_reflectance = 0.70
 
         self.gsrgb_loss = False
         self.init_until_iter = 0

@@ -3,6 +3,7 @@ MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/sh3/truck
 TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/data/tandt/tandt/truck \
     -m $MODEL_DIR \
+    --prior_path ~/autodl-tmp/data/tandt/tandt/truck/priors \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
     --env_scope_radius 1000.0 \
@@ -20,7 +21,14 @@ TRAIN_CMD="python train.py \
     --fastgs_num_cams 10 \
     --lambda_lpips 0 \
     --lambda_edge_aware 0.1 \
-    --edge_aware_from_iter 10000"
+    --edge_aware_from_iter 10000 \
+    --glossy_prior_on \
+    --glossy_from_iter 5000 \
+    --glossy_interval 500 \
+    --glossy_num_cams 8 \
+    --glossy_min_views 3 \
+    --glossy_threshold 0.15 \
+    --glossy_specular_boost 1.0"
 
 eval $TRAIN_CMD
 

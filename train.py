@@ -22,7 +22,11 @@ from tqdm import tqdm
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import *
 from scene import GaussianModel, Scene
-from utils.fast_utils import compute_gaussian_score_rtsplat, edge_aware_loss  # [FASTGS]
+from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
+    compute_gaussian_glossy_score,
+    compute_gaussian_score_rtsplat,
+    edge_aware_loss,
+)
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
@@ -70,6 +74,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 拷贝训练相机列表，每次迭代随机从中取一个视角
     viewpoint_stack = scene.getTrainCameras(scale=1.0).copy()
     print('Training set length', len(viewpoint_stack))
+    if opt.glossy_prior_on:
+        prior_views = sum(camera.has_image_priors() for camera in viewpoint_stack)
+        if prior_views == 0:
+            raise ValueError(
+                '--glossy_prior_on requires complete depth/normal/roughness maps; '
+                'set --prior_path to the mapped prior directory.'
+            )
+        print(f'[GLOSSY-PRIOR] complete prior views: {prior_views}/{len(viewpoint_stack)}')
 
     ema_loss_dict = {}  # 指数移动平均 loss，用于进度条显示
     progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
@@ -364,6 +376,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
+            # Periodically project the 2D material-prior score back to visible
+            # Gaussians and fuse it with their cross-view GT color variation.
+            if (
+                opt.glossy_prior_on
+                and iteration >= opt.glossy_from_iter
+                and iteration % opt.glossy_interval == 0
+            ):
+                glossy_stats = compute_gaussian_glossy_score(
+                    scene.getTrainCameras(), gaussians, pipe, bg, opt
+                )
+                if glossy_stats is not None:
+                    glossy_count = gaussians.update_glossy_prior(
+                        glossy_stats['fused'],
+                        ema=opt.glossy_ema,
+                        threshold=opt.glossy_threshold,
+                        target_roughness=opt.glossy_target_roughness,
+                        target_reflectance=opt.glossy_target_reflectance,
+                    )
+                    visible = glossy_stats['view_count'] > 0
+                    mean_score = glossy_stats['fused'][visible].mean().item() if visible.any() else 0.0
+                    mean_color = glossy_stats['color_variation'][visible].mean().item() if visible.any() else 0.0
+                    print(
+                        f"[GLOSSY-PRIOR] cameras={glossy_stats['used_cameras']} "
+                        f"mean={mean_score:.4f} color-var={mean_color:.4f} "
+                        f"selected={glossy_count}/{gaussians.get_xyz.shape[0]}"
+                    )
+                    if tb_writer:
+                        tb_writer.add_scalar('glossy_prior/mean_fused_score', mean_score, iteration)
+                        tb_writer.add_scalar('glossy_prior/mean_color_variation', mean_color, iteration)
+                        tb_writer.add_scalar('glossy_prior/selected_gaussians', glossy_count, iteration)
+
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + '/chkpnt' + str(iteration) + '.pth')
@@ -437,6 +480,7 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/reflectance', render_pkg['reflectance'], global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/transmissivity', render_pkg['transmissivity'], global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/roughness', render_pkg['roughness'], global_step=iteration)
+                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/glossy_score', render_pkg['glossy_score'], global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/attenuation', render_pkg['attenuation'], global_step=iteration)
 
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_alpha', render_pkg['surface_alpha'], global_step=iteration)

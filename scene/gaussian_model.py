@@ -123,6 +123,10 @@ class GaussianModel:
         self._passthrough_count = torch.empty(0)   # accumulated count of views that passed through an ending Gaussian
         self._per_gaussian_sh_degree = torch.empty(0, dtype=torch.long)  # individual SH degree cap per Gaussian (1-3)
         self._is_high_reflection = torch.empty(0, dtype=torch.bool)      # True if promoted to high-reflection
+        self._prior_glossy_score = torch.empty(0)                        # EMA-fused 2D prior + color variation
+        self._is_prior_glossy = torch.empty(0, dtype=torch.bool)         # persistent source of high-reflection labels
+        self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 0.0))
+        self.glossy_update_count = 0
 
         if args.env_scope_radius > 0:
             self.ENV_CENTER = torch.tensor([float(c) for c in args.env_scope_center], device='cuda')
@@ -210,6 +214,10 @@ class GaussianModel:
         return torch.sigmoid(self._roughness)
 
     @property
+    def get_prior_glossy_score(self):
+        return self._prior_glossy_score.unsqueeze(-1)
+
+    @property
     def get_language_feature(self):
         return torch.tanh(self._language_feature)
 
@@ -292,6 +300,9 @@ class GaussianModel:
         self._passthrough_count = torch.zeros(N, device='cuda')
         self._per_gaussian_sh_degree = torch.ones(N, dtype=torch.long, device='cuda')
         self._is_high_reflection = torch.zeros(N, dtype=torch.bool, device='cuda')
+        self._prior_glossy_score = torch.zeros(N, device='cuda')
+        self._is_prior_glossy = torch.zeros(N, dtype=torch.bool, device='cuda')
+        self.glossy_update_count = 0
 
         self._roughness = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
         self._reflectance = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
@@ -378,6 +389,8 @@ class GaussianModel:
 
         l.append('per_sh_degree')
         l.append('is_high_reflection')
+        l.append('prior_glossy_score')
+        l.append('is_prior_glossy')
 
         return l
 
@@ -402,11 +415,13 @@ class GaussianModel:
 
         per_sh_degree = self._per_gaussian_sh_degree.cpu().numpy().reshape(-1, 1).astype(np.float32)
         is_high_reflection = self._is_high_reflection.cpu().numpy().reshape(-1, 1).astype(np.float32)
+        prior_glossy_score = self._prior_glossy_score.cpu().numpy().reshape(-1, 1).astype(np.float32)
+        is_prior_glossy = self._is_prior_glossy.cpu().numpy().reshape(-1, 1).astype(np.float32)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature, per_sh_degree, is_high_reflection), axis=1)
+        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature, per_sh_degree, is_high_reflection, prior_glossy_score, is_prior_glossy), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -513,6 +528,17 @@ class GaussianModel:
         except Exception:
             self._per_gaussian_sh_degree = torch.ones(N, dtype=torch.long, device='cuda')
             self._is_high_reflection = torch.zeros(N, dtype=torch.bool, device='cuda')
+        try:
+            prior_score = np.asarray(plydata.elements[0]['prior_glossy_score']).astype(np.float32)
+            self._prior_glossy_score = torch.tensor(prior_score, dtype=torch.float, device='cuda')
+            prior_mask = np.asarray(plydata.elements[0]['is_prior_glossy']).astype(bool)
+            self._is_prior_glossy = torch.tensor(prior_mask, dtype=torch.bool, device='cuda')
+            self._is_high_reflection |= self._is_prior_glossy
+            self.glossy_update_count = 1
+        except Exception:
+            self._prior_glossy_score = torch.zeros(N, device='cuda')
+            self._is_prior_glossy = torch.zeros(N, dtype=torch.bool, device='cuda')
+            self.glossy_update_count = 0
         self._ending = torch.zeros(N, device='cuda')
         self._passthrough_count = torch.zeros(N, device='cuda')
 
@@ -589,6 +615,8 @@ class GaussianModel:
         self._passthrough_count = self._passthrough_count[valid_points_mask]
         self._per_gaussian_sh_degree = self._per_gaussian_sh_degree[valid_points_mask]
         self._is_high_reflection = self._is_high_reflection[valid_points_mask]
+        self._prior_glossy_score = self._prior_glossy_score[valid_points_mask]
+        self._is_prior_glossy = self._is_prior_glossy[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -681,6 +709,8 @@ class GaussianModel:
         # [HIGH-REFL] save parent values before postfix changes tensor sizes
         _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].repeat(N)
         _new_is_hr = self._is_high_reflection[selected_pts_mask].repeat(N)
+        _new_glossy_score = self._prior_glossy_score[selected_pts_mask].repeat(N)
+        _new_is_prior_glossy = self._is_prior_glossy[selected_pts_mask].repeat(N)
         _n_new = N * selected_pts_mask.sum()
 
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask].repeat(N, 1)), dim=0)
@@ -692,6 +722,8 @@ class GaussianModel:
         self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
         self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
         self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
+        self._prior_glossy_score = torch.cat([self._prior_glossy_score, _new_glossy_score])
+        self._is_prior_glossy = torch.cat([self._is_prior_glossy, _new_is_prior_glossy])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
@@ -719,6 +751,8 @@ class GaussianModel:
         _n_new = selected_pts_mask.sum()
         _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].clone()
         _new_is_hr = self._is_high_reflection[selected_pts_mask].clone()
+        _new_glossy_score = self._prior_glossy_score[selected_pts_mask].clone()
+        _new_is_prior_glossy = self._is_prior_glossy[selected_pts_mask].clone()
 
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask]), dim=0)
 
@@ -729,6 +763,8 @@ class GaussianModel:
         self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
         self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
         self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
+        self._prior_glossy_score = torch.cat([self._prior_glossy_score, _new_glossy_score])
+        self._is_prior_glossy = torch.cat([self._is_prior_glossy, _new_is_prior_glossy])
 
     # [FASTGS BEGIN] ──────────────────────────────────────────────────────────
     # 多视角一致性引导的 densification/pruning 方法
@@ -756,6 +792,8 @@ class GaussianModel:
         _n_new = selected_pts_mask.sum()
         _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].clone()
         _new_is_hr = self._is_high_reflection[selected_pts_mask].clone()
+        _new_glossy_score = self._prior_glossy_score[selected_pts_mask].clone()
+        _new_is_prior_glossy = self._is_prior_glossy[selected_pts_mask].clone()
 
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask]), dim=0)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_occupancies, new_opacity, new_transmissivity, new_scaling, new_rotation, new_reflectance, new_roughness, new_language_feature)
@@ -765,6 +803,8 @@ class GaussianModel:
         self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
         self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
         self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
+        self._prior_glossy_score = torch.cat([self._prior_glossy_score, _new_glossy_score])
+        self._is_prior_glossy = torch.cat([self._is_prior_glossy, _new_is_prior_glossy])
 
     def densify_and_split_fastgs(self, metric_mask, all_splits, N=2):
         """分裂满足条件的高斯：尺寸大 + 尺寸梯度大 + 多视角认证重建差"""
@@ -798,6 +838,8 @@ class GaussianModel:
         # [HIGH-REFL] save parent values before postfix changes tensor sizes
         _new_sh_degree = self._per_gaussian_sh_degree[selected_pts_mask].repeat(N)
         _new_is_hr = self._is_high_reflection[selected_pts_mask].repeat(N)
+        _new_glossy_score = self._prior_glossy_score[selected_pts_mask].repeat(N)
+        _new_is_prior_glossy = self._is_prior_glossy[selected_pts_mask].repeat(N)
         _n_new = N * selected_pts_mask.sum()
 
         self.last_update = torch.cat((self.last_update, self.last_update[selected_pts_mask].repeat(N, 1)), dim=0)
@@ -808,6 +850,8 @@ class GaussianModel:
         self._passthrough_count = torch.cat([self._passthrough_count, torch.zeros(_n_new, device='cuda')])
         self._per_gaussian_sh_degree = torch.cat([self._per_gaussian_sh_degree, _new_sh_degree])
         self._is_high_reflection = torch.cat([self._is_high_reflection, _new_is_hr])
+        self._prior_glossy_score = torch.cat([self._prior_glossy_score, _new_glossy_score])
+        self._is_prior_glossy = torch.cat([self._is_prior_glossy, _new_is_prior_glossy])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
         self.prune_points(prune_filter)
@@ -908,6 +952,52 @@ class GaussianModel:
     # [FASTGS END] ────────────────────────────────────────────────────────────
 
     # [HIGH-REFL] ──────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def update_glossy_prior(
+        self,
+        score,
+        ema=0.8,
+        threshold=0.15,
+        target_roughness=0.15,
+        target_reflectance=0.70,
+    ):
+        """Update persistent per-Gaussian glossy state and material bounds."""
+        score = torch.nan_to_num(score.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        if score.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError(
+                f'Glossy score length {score.shape[0]} does not match '
+                f'{self.get_xyz.shape[0]} Gaussians'
+            )
+        if self.glossy_update_count == 0:
+            self._prior_glossy_score.copy_(score)
+        else:
+            momentum = min(max(float(ema), 0.0), 0.9999)
+            self._prior_glossy_score.mul_(momentum).add_(score, alpha=1.0 - momentum)
+        self.glossy_update_count += 1
+
+        previous_prior = self._is_prior_glossy.clone()
+        self._is_prior_glossy = self._prior_glossy_score >= float(threshold)
+        removed_prior = previous_prior & ~self._is_prior_glossy
+        removable = removed_prior & (self._per_gaussian_sh_degree < self.max_sh_degree)
+        self._is_high_reflection[removable] = False
+        self._is_high_reflection[self._is_prior_glossy] = True
+        self._per_gaussian_sh_degree[self._is_prior_glossy] = self.max_sh_degree
+
+        roughness = min(max(float(target_roughness), 1e-4), 1.0 - 1e-4)
+        reflectance = min(max(float(target_reflectance), 1e-4), 1.0 - 1e-4)
+        roughness_logit = inverse_sigmoid(torch.tensor(roughness, device=self._roughness.device))
+        reflectance_logit = inverse_sigmoid(torch.tensor(reflectance, device=self._reflectance.device))
+        mask = self._is_prior_glossy
+        if mask.any():
+            self._roughness.data[mask] = torch.minimum(
+                self._roughness.data[mask], roughness_logit.expand_as(self._roughness.data[mask])
+            )
+            self._reflectance.data[mask] = torch.maximum(
+                self._reflectance.data[mask], reflectance_logit.expand_as(self._reflectance.data[mask])
+            )
+        self.active_sh_degree = int(self._per_gaussian_sh_degree.max().item())
+        return int(mask.sum().item())
+
     def update_high_reflection_gaussians(self, num_cameras, reflectance_boost=1.0, roughness_reduction=0.5):
         """窗口式 SH 阶数管理：每次调用对应一个统计窗口（500 iter）。
 
@@ -927,13 +1017,15 @@ class GaussianModel:
         """
         with torch.no_grad():
             # ── 降阶 ──────────────────────────────────────────────────────────
-            demote_mask = (self._per_gaussian_sh_degree > 1) & (self._ending == 0)
+            demote_mask = (self._per_gaussian_sh_degree > 1) & (self._ending == 0) \
+                           & ~self._is_prior_glossy
             if demote_mask.any():
                 self._per_gaussian_sh_degree[demote_mask] = (
                     self._per_gaussian_sh_degree[demote_mask] - 1
                 ).clamp(min=1)
                 # 从 3 阶降下来的取消 high_reflection 标记（材质参数让优化器自行修正）
-                lost_max = demote_mask & (self._per_gaussian_sh_degree < self.max_sh_degree)
+                lost_max = demote_mask & (self._per_gaussian_sh_degree < self.max_sh_degree) \
+                           & ~self._is_prior_glossy
                 self._is_high_reflection[lost_max] = False
                 self._passthrough_count[demote_mask] = 0  # 重置，从新阶数重新累计
 

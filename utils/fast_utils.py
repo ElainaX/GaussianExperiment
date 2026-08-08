@@ -1,7 +1,7 @@
 import random
 import torch
 import torch.nn.functional as F
-from gaussian_renderer import render
+from gaussian_renderer import accumulate_gaussian_map, render
 
 
 def _sample_cameras(viewpoint_stack, num_cams):
@@ -20,6 +20,146 @@ def _sobel_edge(img_gray_hw):
     ey = F.conv2d(g, k_y, padding=1)[0,0]
     edge = torch.sqrt(ex**2 + ey**2 + 1e-8)  # epsilon inside sqrt prevents NaN gradient at flat regions
     return edge / (edge.max() + 1e-6)
+
+
+def _normalize01(tensor):
+    tensor = torch.nan_to_num(tensor.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    lo, hi = tensor.amin(), tensor.amax()
+    return (tensor - lo) / (hi - lo + 1e-6)
+
+
+def _haar_detail(gray_hw, levels=2):
+    """Return a normalized multi-level Haar detail-energy map in [0, 1]."""
+    height, width = gray_hw.shape
+    current = gray_hw[None, None]
+    detail_full = torch.zeros_like(current)
+    for level in range(max(1, int(levels))):
+        if min(current.shape[-2:]) < 2:
+            break
+        pad_h = current.shape[-2] % 2
+        pad_w = current.shape[-1] % 2
+        padded = F.pad(current, (0, pad_w, 0, pad_h), mode='replicate')
+        a = padded[..., 0::2, 0::2]
+        b = padded[..., 0::2, 1::2]
+        c = padded[..., 1::2, 0::2]
+        d = padded[..., 1::2, 1::2]
+        ll = (a + b + c + d) * 0.5
+        lh = (a - b + c - d) * 0.5
+        hl = (a + b - c - d) * 0.5
+        hh = (a - b - c + d) * 0.5
+        detail = torch.sqrt(lh.square() + hl.square() + hh.square() + 1e-8)
+        detail_full += F.interpolate(
+            detail, size=(height, width), mode='bilinear', align_corners=False
+        ) / float(2**level)
+        current = ll
+    return _normalize01(detail_full[0, 0])
+
+
+@torch.no_grad()
+def build_prior_glossy_map(camera, opt, device='cuda'):
+    """Build a per-view 2D glossy probability from RGB/material priors.
+
+    Low roughness and Haar/RGB highlight evidence increase the score. Depth and
+    normal discontinuities suppress ordinary geometry edges that would otherwise
+    be mistaken for specular high frequencies.
+    """
+    if not camera.has_image_priors():
+        return None
+    priors = camera.load_image_priors(device=device)
+    if any(priors[name] is None for name in ('depth', 'normal', 'roughness')):
+        return None
+
+    rgb = camera.original_image[:3].to(device=device, dtype=torch.float32)
+    gray = (rgb * rgb.new_tensor([0.299, 0.587, 0.114])[:, None, None]).sum(dim=0)
+    roughness = priors['roughness'][0].clamp(0.0, 1.0)
+    depth = _normalize01(priors['depth'][0])
+    normal = priors['normal']
+
+    roughness_score = (1.0 - roughness).pow(float(opt.glossy_roughness_power))
+    wavelet_score = _haar_detail(gray, opt.glossy_wavelet_levels).pow(
+        float(opt.glossy_wavelet_power)
+    )
+    highlight_score = _normalize01(gray).pow(float(opt.glossy_highlight_power))
+
+    depth_edge = _sobel_edge(depth)
+    normal_edge = torch.stack([_sobel_edge(normal[channel]) for channel in range(3)]).mean(dim=0)
+    geometry_edge = (depth_edge + normal_edge).clamp(0.0, 1.0)
+    geometry_confidence = torch.exp(
+        -float(opt.glossy_geometry_suppression) * geometry_edge
+    )
+
+    # Low roughness remains the main gate. Haar detail and brightness strengthen
+    # the evidence without suppressing broad, smooth reflections entirely.
+    appearance_evidence = 0.35 + 0.35 * wavelet_score + 0.30 * highlight_score
+    score = roughness_score * appearance_evidence * geometry_confidence
+    return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
+    """Fuse 2D glossy priors and cross-view RGB variation per Gaussian.
+
+    Each scalar image is accumulated by the CUDA rasterizer with the same
+    alpha*transmittance contribution used for surface compositing. RGB is first
+    reduced to one observation per Gaussian per view, then its cross-view
+    variance is combined with the material prior.
+    """
+    eligible = [camera for camera in viewpoint_stack if camera.has_image_priors()]
+    if not eligible:
+        return None
+    camlist = _sample_cameras(eligible, opt.glossy_num_cams)
+    num_gaussians = gaussians.get_xyz.shape[0]
+    device = gaussians.get_xyz.device
+    prior_numerator = torch.zeros(num_gaussians, device=device)
+    total_weight = torch.zeros(num_gaussians, device=device)
+    color_sum = torch.zeros(num_gaussians, 3, device=device)
+    color_sq_sum = torch.zeros(num_gaussians, 3, device=device)
+    view_count = torch.zeros(num_gaussians, device=device)
+    used_cameras = 0
+
+    for camera in camlist:
+        glossy_map = build_prior_glossy_map(camera, opt, device=device)
+        if glossy_map is None:
+            continue
+        rgb = camera.original_image[:3].to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+        weight, _ = accumulate_gaussian_map(camera, gaussians, bg, torch.ones_like(glossy_map))
+        glossy_accum, _ = accumulate_gaussian_map(camera, gaussians, bg, glossy_map)
+        rgb_accum = torch.stack(
+            [accumulate_gaussian_map(camera, gaussians, bg, rgb[channel])[0] for channel in range(3)],
+            dim=-1,
+        )
+
+        valid = weight > float(opt.glossy_min_accum_weight)
+        if not valid.any():
+            continue
+        observation = rgb_accum / weight.clamp_min(1e-8)[:, None]
+        prior_numerator += glossy_accum
+        total_weight += weight
+        color_sum[valid] += observation[valid]
+        color_sq_sum[valid] += observation[valid].square()
+        view_count[valid] += 1
+        used_cameras += 1
+
+    if used_cameras == 0:
+        return None
+
+    prior_score = (prior_numerator / total_weight.clamp_min(1e-8)).clamp(0.0, 1.0)
+    mean_color = color_sum / view_count.clamp_min(1.0)[:, None]
+    color_variance = color_sq_sum / view_count.clamp_min(1.0)[:, None] - mean_color.square()
+    color_variance = color_variance.clamp_min(0.0).mean(dim=-1)
+    color_score = 1.0 - torch.exp(-float(opt.glossy_color_var_scale) * color_variance)
+    confidence = (view_count / max(1, int(opt.glossy_min_views))).clamp(0.0, 1.0)
+    color_gate = float(opt.glossy_color_floor) + (1.0 - float(opt.glossy_color_floor)) * color_score
+    fused_score = (prior_score * color_gate * confidence).clamp(0.0, 1.0)
+
+    return {
+        'fused': fused_score,
+        'prior': prior_score,
+        'color_variation': color_score,
+        'confidence': confidence,
+        'view_count': view_count,
+        'used_cameras': used_cameras,
+    }
 
 
 def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, skip_importance=False):

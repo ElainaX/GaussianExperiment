@@ -128,6 +128,7 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, render_pkg['render_tran'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'transmitted_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['glossy_score'][0].cpu().numpy(), os.path.join(vis_path, 'glossy_score_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['transmissivity'][0].cpu().numpy(), os.path.join(vis_path, 'transmissivity_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['attenuation'][0].cpu().numpy(), os.path.join(vis_path, 'attenuation_{0:05d}'.format(i) + '.png'))
 

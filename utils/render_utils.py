@@ -281,7 +281,7 @@ def create_videos(base_dir, input_dir, out_name, num_frames=480, fps=30):
         'crf': 18,
     }
 
-    for k in ['specular', 'transmitted', 'volume_depth', 'surface_normal', 'color']:
+    for k in ['specular', 'glossy_score', 'transmitted', 'volume_depth', 'surface_normal', 'color']:
         video_file = os.path.join(base_dir, f'{video_prefix}_{k}.mp4')
         input_format = 'rgb'
 

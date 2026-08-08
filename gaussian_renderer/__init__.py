@@ -13,6 +13,53 @@ from utils.point_utils import *
 from utils.sph_utils import *
 
 
+@torch.no_grad()
+def accumulate_gaussian_map(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor, value_map: torch.Tensor):
+    """Alpha-composite a scalar image map back onto the visible Gaussians.
+
+    The CUDA rasterizer accumulates ``value_map[pixel] * alpha * transmittance``
+    for every contributing Gaussian. Calling this once with an all-ones map
+    provides the matching normalization weight. This lightweight path performs
+    only the surface rasterization and skips RT-Splatting's volume/PBR passes.
+    """
+    image_height = int(viewpoint_camera.image_height)
+    image_width = int(viewpoint_camera.image_width)
+    if value_map.numel() != image_height * image_width:
+        raise ValueError(
+            f'value_map has {value_map.numel()} elements, expected '
+            f'{image_height}x{image_width}'
+        )
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=image_height,
+        image_width=image_width,
+        tanfovx=math.tan(viewpoint_camera.FoVx * 0.5),
+        tanfovy=math.tan(viewpoint_camera.FoVy * 0.5),
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    means2D = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, device='cuda')
+    _, _, radii, _, _, accumulated = rasterizer(
+        means3D=pc.get_xyz,
+        means2D=means2D,
+        shs=pc.get_features,
+        extras=None,
+        opacities=pc.get_occupancy,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None,
+        protection_map=value_map.reshape(-1).to(device='cuda', dtype=torch.float32).contiguous(),
+    )
+    return accumulated, radii > 0
+
+
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, metric_map=None, protection_map=None):  # [FASTGS]
     """
     Render the scene.
@@ -101,7 +148,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     inside_mask = pc.get_inside_mask.float()
     extras = torch.cat([pc.get_roughness, pc.get_language_feature,
                         inside_mask, inside_mask * pc.get_reflectance,
-                        opacity, inside_mask * pc.get_transmissivity], dim=-1)
+                        opacity, inside_mask * pc.get_transmissivity,
+                        pc.get_prior_glossy_score], dim=-1)
 
     # [FASTGS] surface pass：metric_map 用于高误差计数，protection_map 用于边缘保护分
     render_scat, surface_extras, radii, surface_allmap, accum_metric_counts, accum_protection = rasterizer(
@@ -117,7 +165,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         protection_map=protection_map,
     )
 
-    render_roughness, render_feature, foreground, render_reflectance, surface_opacity, render_transmissivity = surface_extras.split([1, 4, 1, 1, 1, 1], dim=0)
+    render_roughness, render_feature, foreground, render_reflectance, surface_opacity, render_transmissivity, render_glossy_score = surface_extras.split([1, 4, 1, 1, 1, 1, 1], dim=0)
 
     foreground = foreground.detach()
 
@@ -192,7 +240,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     final_tran = render_tran * render_transmissivity
     final_scat = render_scat * (1 - render_transmissivity)
-    final_spec = render_spec * render_reflectance
+    glossy_gain = 1.0 + pc.glossy_specular_boost * render_glossy_score.clamp(0.0, 1.0)
+    final_spec = render_spec * render_reflectance * glossy_gain
     final_rendering = final_tran + final_scat
 
     if not pipe.init_stage:
@@ -211,6 +260,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         'feature': render_feature,
         'roughness': render_roughness,
         'reflectance': render_reflectance,
+        'glossy_score': render_glossy_score,
         'transmissivity': render_transmissivity,
         'attenuation': render_attenuation,
         'foreground': foreground,
