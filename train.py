@@ -75,7 +75,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_stack = scene.getTrainCameras(scale=1.0).copy()
     print('Training set length', len(viewpoint_stack))
     if opt.glossy_prior_on:
-        prior_views = sum(camera.has_image_priors() for camera in viewpoint_stack)
+        prior_views = sum(camera.has_image_priors for camera in viewpoint_stack)
         if prior_views == 0:
             raise ValueError(
                 '--glossy_prior_on requires complete depth/normal/roughness maps; '

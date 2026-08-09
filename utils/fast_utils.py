@@ -63,7 +63,7 @@ def build_prior_glossy_map(camera, opt, device='cuda'):
     normal discontinuities suppress ordinary geometry edges that would otherwise
     be mistaken for specular high frequencies.
     """
-    if not camera.has_image_priors():
+    if not camera.has_image_priors:
         return None
     priors = camera.load_image_priors(device=device)
     if any(priors[name] is None for name in ('depth', 'normal', 'roughness')):
@@ -104,7 +104,7 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
     reduced to one observation per Gaussian per view, then its cross-view
     variance is combined with the material prior.
     """
-    eligible = [camera for camera in viewpoint_stack if camera.has_image_priors()]
+    eligible = [camera for camera in viewpoint_stack if camera.has_image_priors]
     if not eligible:
         return None
     camlist = _sample_cameras(eligible, opt.glossy_num_cams)

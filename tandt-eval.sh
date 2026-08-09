@@ -1,9 +1,10 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/sh3/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors/truck
+set -euo pipefail
 
 TRAIN_CMD="python train.py \
-    -s ~/autodl-tmp/data/tandt/tandt/truck \
+    -s ~/autodl-tmp/truck \
     -m $MODEL_DIR \
-    --prior_path ~/autodl-tmp/data/tandt/tandt/truck/priors \
+    --prior_path ~/autodl-tmp/truck/priors \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
     --env_scope_radius 1000.0 \
@@ -30,10 +31,10 @@ TRAIN_CMD="python train.py \
     --glossy_threshold 0.15 \
     --glossy_specular_boost 1.0"
 
-eval $TRAIN_CMD
-
 mkdir -p $MODEL_DIR
 echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt
+
+eval "$TRAIN_CMD"
 
 python render.py -m $MODEL_DIR
 
