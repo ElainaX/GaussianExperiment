@@ -98,7 +98,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 按迭代数衰减各属性的学习率（位置学习率按指数衰减，其他固定）
         gaussians.update_learning_rate(iteration)
 
-        # SH 阶数由 update_high_reflection_gaussians 按高斯的视角一致性动态升级，不再全局递增
+        # Match goodV1_rtsplat-baseline: progressively enable the global SH degree.
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
 
         # ------------------------------------------------------------------
         # 取一个随机训练视角及其 GT 图像
@@ -267,59 +269,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration in saving_iterations:
                 print('\n[ITER {}] Saving Gaussians'.format(iteration))
                 scene.save(iteration)
-
-            # =========================================================
-            # [HIGH-REFL] 逐帧统计 ending / passthrough
-            # ending 高斯：当前帧有效 alpha（occupancy×opacity）> 阈值，视为终止 alpha 合成的高斯
-            # passthrough：已经是 ending 高斯，但在当前帧被射线穿过（alpha 未在此终止）
-            # =========================================================
-            _ENDING_ALPHA_THRESH = 0.5
-            _eff_alpha = (gaussians.get_occupancy * gaussians.get_opacity).squeeze(-1)  # [N]
-            _visible = radii > 0  # [N]
-            _is_ending = _visible & (_eff_alpha > _ENDING_ALPHA_THRESH)
-            gaussians._ending[_is_ending] += 1
-            _already_ending = gaussians._ending > 0
-            _is_passthrough = _visible & _already_ending & ~_is_ending
-            gaussians._passthrough_count[_is_passthrough] += 1
-
-            # 每 500 iter 检查并升级 high-reflection 高斯
-            # 阈值 = 训练相机总数：passthrough_count 累计超过一整轮相机才升一阶
-            if iteration % 500 == 0 and iteration > 0:
-                gaussians.update_high_reflection_gaussians(
-                    num_cameras=len(viewpoint_stack),
-                    reflectance_boost=1.0,
-                    roughness_reduction=0.5,
-                )
-
-            # 每 1000 iter 渲染并保存 high-reflection 可视化图
-            if iteration % 1000 == 0 and iteration > 0:
-                import os
-                from PIL import Image as PILImage
-                _C0 = 0.28209479177387814  # degree-0 SH normalization constant
-                _N = gaussians.get_xyz.shape[0]
-                _old_dc = gaussians._features_dc.data.clone()
-                _old_sh = gaussians.active_sh_degree
-
-                # high-reflection → red, others → dark grey (as SH DC coefficients)
-                _new_dc = torch.zeros(_N, 1, 3, device='cuda')
-                _grey = torch.tensor([(0.3 - 0.5) / _C0] * 3, device='cuda')
-                _red = torch.tensor([(c - 0.5) / _C0 for c in [1.0, 0.1, 0.1]], device='cuda')
-                _new_dc[:, 0, :] = _grey
-                _new_dc[gaussians._is_high_reflection, 0, :] = _red
-
-                gaussians._features_dc.data = _new_dc
-                gaussians.active_sh_degree = 0
-
-                _hr_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-                _hr_img = _hr_pkg['render_tran'].clamp(0.0, 1.0)
-
-                gaussians._features_dc.data = _old_dc
-                gaussians.active_sh_degree = _old_sh
-
-                _hr_dir = os.path.join(scene.model_path, 'high_reflection_maps')
-                os.makedirs(_hr_dir, exist_ok=True)
-                _hr_np = (_hr_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                PILImage.fromarray(_hr_np).save(os.path.join(_hr_dir, f'iter_{iteration:05d}.png'))
 
             # =========================================================
             # 阶段④：Densification（高斯的自适应增删）
