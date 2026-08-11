@@ -45,6 +45,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 阶段①：初始化
     # =========================================================================
     first_iter = 0
+    # ``render.py`` reloads only ``cfg_args``. Persist glossy optimization
+    # settings alongside ModelParams so debug priors use the exact training
+    # configuration. Older checkpoints remain supported by fallback defaults.
+    for name, value in vars(opt).items():
+        if name.startswith('glossy_'):
+            setattr(dataset, name, value)
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
 
     # 创建高斯模型（包含位置/颜色/不透明度/协方差等所有可学习参数）

@@ -152,7 +152,13 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     depth = _normalize01(priors['depth'][0])
     normal = priors['normal']
 
-    roughness_score = (1.0 - roughness).pow(float(opt.glossy_roughness_power))
+    # ``render.py`` reconstructs its Namespace from ``cfg_args``, which only
+    # contains ModelParams in existing checkpoints.  Keep every visualization
+    # option backward-compatible so an already trained model can be rendered
+    # without requiring its OptimizationParams to be present.
+    roughness_score = (1.0 - roughness).pow(
+        float(getattr(opt, 'glossy_roughness_power', 2.0))
+    )
     near_levels = int(getattr(opt, 'glossy_wavelet_levels', 2))
     far_levels = int(getattr(opt, 'glossy_wavelet_far_levels', 4))
     wavelet_near = _haar_detail(gray, near_levels)
@@ -166,15 +172,17 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     # directly.  Far pixels use coarser Haar evidence because the same physical
     # feature covers fewer pixels there.
     wavelet_score = torch.lerp(wavelet_near, wavelet_far, depth_scale_weight).pow(
-        float(opt.glossy_wavelet_power)
+        float(getattr(opt, 'glossy_wavelet_power', 1.0))
     )
-    highlight_score = _normalize01(gray).pow(float(opt.glossy_highlight_power))
+    highlight_score = _normalize01(gray).pow(
+        float(getattr(opt, 'glossy_highlight_power', 1.0))
+    )
 
     depth_edge = _sobel_edge(depth)
     normal_edge = torch.stack([_sobel_edge(normal[channel]) for channel in range(3)]).mean(dim=0)
     geometry_edge = (depth_edge + normal_edge).clamp(0.0, 1.0)
     geometry_confidence = torch.exp(
-        -float(opt.glossy_geometry_suppression) * geometry_edge
+        -float(getattr(opt, 'glossy_geometry_suppression', 2.0)) * geometry_edge
     )
 
     # Low roughness remains the main gate. Haar detail and brightness strengthen

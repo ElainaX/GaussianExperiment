@@ -79,7 +79,10 @@ class GaussianExtractor(object):
         """
         if bg_color is None:
             bg_color = [0, 0, 0]
-        self.background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
+        if torch.is_tensor(bg_color):
+            self.background = bg_color.detach().clone().to(device='cuda', dtype=torch.float32)
+        else:
+            self.background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
         self.gaussians = gaussians
         self.render = render
         self.prior_options = prior_options
