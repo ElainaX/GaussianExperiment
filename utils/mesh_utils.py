@@ -121,15 +121,45 @@ class GaussianExtractor(object):
                 self.depthmaps.append(render_pkg['surface_depth'].cpu())
                 if export_path is not None:
                     prior_debug = None
+                    normal_prior_debug = None
                     if self.prior_options is not None and viewpoint_cam.has_image_priors:
                         # Import lazily to avoid coupling mesh extraction to the
                         # training-only glossy-prior path when no priors exist.
-                        from utils.fast_utils import build_prior_glossy_map
+                        from utils.fast_utils import (
+                            build_prior_glossy_map,
+                            normal_prior_supervision,
+                        )
                         prior_debug = build_prior_glossy_map(
                             viewpoint_cam,
                             self.prior_options,
                             device=rgb.device,
                             return_details=True,
+                        )
+                        normal_prior_debug = normal_prior_supervision(
+                            viewpoint_cam,
+                            render_pkg['surface_normal'],
+                            render_pkg['foreground'],
+                            render_pkg['surface_alpha'],
+                            axis_sign=getattr(
+                                self.prior_options,
+                                'normal_prior_axis_sign',
+                                [-1.0, 1.0, 1.0],
+                            ),
+                            edge_suppression=getattr(
+                                self.prior_options,
+                                'normal_prior_edge_suppression',
+                                2.0,
+                            ),
+                            min_alpha=getattr(
+                                self.prior_options,
+                                'normal_prior_min_alpha',
+                                0.05,
+                            ),
+                            pool_size=getattr(
+                                self.prior_options,
+                                'normal_prior_pool_size',
+                                3,
+                            ),
                         )
                     gt = viewpoint_cam.original_image
                     mask = viewpoint_cam.gt_transparent_mask.squeeze(0).float()
@@ -164,17 +194,62 @@ class GaussianExtractor(object):
                             'depth_scale_weight': 'glossy_depth_scale_weight',
                             'geometry_confidence': 'glossy_geometry_confidence',
                             'score_before_guided': 'glossy_before_guided',
-                            'score': 'glossy_after_guided',
+                            'score_after_guided': 'glossy_after_guided',
+                            'plane_consensus_delta': 'glossy_plane_consensus_delta_x10',
+                            'plane_consensus_confidence': 'glossy_plane_consensus_confidence',
+                            'score': 'glossy_after_plane_consensus',
                         }
                         for debug_key, filename_prefix in debug_names.items():
+                            debug_image = prior_debug[debug_key]
+                            if debug_key == 'plane_consensus_delta':
+                                # Raw corrections are intentionally small; a
+                                # fixed 10x gain makes repaired holes visible.
+                                debug_image = (debug_image * 10.0).clamp(0.0, 1.0)
                             executor.submit(
                                 save_img_u8,
-                                prior_debug[debug_key].cpu().numpy(),
+                                debug_image.cpu().numpy(),
                                 os.path.join(
                                     vis_path,
                                     f'{filename_prefix}_{i:05d}.png',
                                 ),
                             )
+                    if normal_prior_debug is not None:
+                        executor.submit(
+                            save_img_u8,
+                            (normal_prior_debug['prior_camera'] * 0.5 + 0.5)
+                            .permute(1, 2, 0).cpu().numpy(),
+                            os.path.join(vis_path, f'normal_prior_aligned_{i:05d}.png'),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            (normal_prior_debug['compared_prior'] * 0.5 + 0.5)
+                            .permute(1, 2, 0).cpu().numpy(),
+                            os.path.join(
+                                vis_path,
+                                f'normal_prior_region_mean_{i:05d}.png',
+                            ),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            (normal_prior_debug['compared_rendered'] * 0.5 + 0.5)
+                            .permute(1, 2, 0).cpu().numpy(),
+                            os.path.join(
+                                vis_path,
+                                f'surface_normal_region_mean_{i:05d}.png',
+                            ),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            apply_colormap(
+                                (normal_prior_debug['error'] / 2.0).clamp(0.0, 1.0)
+                            ).permute(1, 2, 0).cpu().numpy(),
+                            os.path.join(vis_path, f'normal_prior_error_{i:05d}.png'),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            normal_prior_debug['confidence'][0].cpu().numpy(),
+                            os.path.join(vis_path, f'normal_prior_confidence_{i:05d}.png'),
+                        )
                     executor.submit(save_img_u8, render_pkg['transmissivity'][0].cpu().numpy(), os.path.join(vis_path, 'transmissivity_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['attenuation'][0].cpu().numpy(), os.path.join(vis_path, 'attenuation_{0:05d}'.format(i) + '.png'))
 

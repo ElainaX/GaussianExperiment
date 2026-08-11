@@ -65,6 +65,10 @@ class Camera(nn.Module):
         self.prior_depth_path = prior_depth_path
         self.prior_normal_path = prior_normal_path
         self.prior_roughness_path = prior_roughness_path
+        # Lazily cache the resized uint8 normal map on CPU. Normal-prior
+        # supervision accesses one view every iteration; caching avoids tens of
+        # thousands of repeated PNG decodes without occupying GPU memory.
+        self._prior_normal_u8_cache = None
 
         self.gt_transparent_mask = gt_transparent_mask.to(self.data_device)
 
@@ -116,15 +120,33 @@ class Camera(nn.Module):
 
         depth = load_map(self.prior_depth_path, 'L')
         roughness = load_map(self.prior_roughness_path, 'L')
-        normal = load_map(self.prior_normal_path, 'RGB')
-        if normal is not None:
-            normal = F.normalize(normal * 2.0 - 1.0, dim=0, eps=1e-6)
+        normal = self.load_normal_prior(device=target_device)
 
         return {
             'depth': depth,
             'normal': normal,
             'roughness': roughness,
         }
+
+    def load_normal_prior(self, device=None):
+        """Load and decode the aligned camera-space normal prior.
+
+        A resized uint8 copy is retained on CPU and converted to float only for
+        the active view, keeping the cache compact and GPU usage temporary.
+        """
+        if self.prior_normal_path is None:
+            return None
+        target_device = self.data_device if device is None else torch.device(device)
+        if self._prior_normal_u8_cache is None:
+            resolution = (self.image_width, self.image_height)
+            with Image.open(self.prior_normal_path) as image:
+                resized = image.convert('RGB').resize(resolution)
+                array = np.array(resized, dtype=np.uint8, copy=True)
+            self._prior_normal_u8_cache = torch.from_numpy(array).permute(2, 0, 1).contiguous()
+        normal = self._prior_normal_u8_cache.to(
+            device=target_device, dtype=torch.float32, non_blocking=True
+        ) / 255.0
+        return F.normalize(normal * 2.0 - 1.0, dim=0, eps=1e-6)
 
 
 class MiniCam:

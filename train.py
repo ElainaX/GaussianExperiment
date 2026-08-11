@@ -26,6 +26,7 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
     compute_gaussian_glossy_score,
     compute_gaussian_score_rtsplat,
     edge_aware_loss,
+    normal_prior_supervision,
 )
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
@@ -45,11 +46,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 阶段①：初始化
     # =========================================================================
     first_iter = 0
-    # ``render.py`` reloads only ``cfg_args``. Persist glossy optimization
-    # settings alongside ModelParams so debug priors use the exact training
-    # configuration. Older checkpoints remain supported by fallback defaults.
+    # ``render.py`` reloads only ``cfg_args``. Persist prior-related settings
+    # alongside ModelParams so debug maps use the exact training configuration.
+    # Older checkpoints remain supported by fallback defaults.
     for name, value in vars(opt).items():
-        if name.startswith('glossy_'):
+        if (
+            name.startswith('glossy_') or
+            name.startswith('normal_prior_') or
+            name == 'lambda_normal_prior'
+        ):
             setattr(dataset, name, value)
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
 
@@ -207,6 +212,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             norm_loss = opt.norm_loss_weight * error.mean()
             loss += norm_loss
             loss_dict['norm'] = norm_loss.item()
+
+        # External normal-prior supervision. The prior itself is fixed; this
+        # cosine loss backpropagates into rendered Gaussian orientations.
+        if (
+            opt.lambda_normal_prior > 0 and
+            iteration >= opt.normal_prior_from_iter and
+            viewpoint_cam.prior_normal_path is not None
+        ):
+            normal_prior_pkg = normal_prior_supervision(
+                viewpoint_cam,
+                surface_normal,
+                foreground,
+                render_pkg['surface_alpha'],
+                axis_sign=opt.normal_prior_axis_sign,
+                edge_suppression=opt.normal_prior_edge_suppression,
+                min_alpha=opt.normal_prior_min_alpha,
+                pool_size=opt.normal_prior_pool_size,
+            )
+            if normal_prior_pkg is not None:
+                warmup = max(1, int(opt.normal_prior_warmup_iters))
+                warmup_scale = min(
+                    1.0,
+                    (iteration - opt.normal_prior_from_iter + 1) / warmup,
+                )
+                prior_norm_loss = (
+                    float(opt.lambda_normal_prior) * warmup_scale *
+                    normal_prior_pkg['loss']
+                )
+                loss += prior_norm_loss
+                loss_dict['normal_prior'] = prior_norm_loss.item()
 
         # === 体积分散 loss：惩罚同一射线上的高斯过于分散，鼓励高斯贴合表面 ===
         if iteration >= opt.dist_loss_from_iter and opt.dist_loss_weight > 0:

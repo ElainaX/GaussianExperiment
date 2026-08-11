@@ -132,6 +132,260 @@ def _surface_guided_filter(
     return filtered.clamp(0.0, 1.0)
 
 
+def _plane_majority_consensus(
+    score,
+    depth,
+    normal,
+    threshold=0.30,
+    downsample=8,
+    radius=5,
+    iterations=1,
+    majority=0.60,
+    blend=0.75,
+    normal_sigma=0.06,
+    depth_sigma=0.05,
+    depth_weight_floor=0.50,
+    min_support=0.35,
+):
+    """Repair low-score holes when a planar neighborhood votes glossy.
+
+    Reflected content may make an image prior predict a tree or building rather
+    than the physical glass surface.  Roughness is intentionally excluded from
+    plane membership here because it is precisely the potentially corrupted
+    cue.  Normal agreement is the main guide, while depth is only a soft
+    boundary so an erroneous reflected depth cannot completely isolate a hole.
+
+    The operation is asymmetric: it only raises low outliers when a clear
+    high-score majority exists.  This avoids erasing small true mirrors merely
+    because a larger diffuse surface lies nearby.
+    """
+    downsample = max(1, int(downsample))
+    radius = max(0, int(radius))
+    iterations = max(0, int(iterations))
+    if radius == 0 or iterations == 0:
+        zeros = torch.zeros_like(score)
+        return score, zeros, zeros
+
+    majority = min(max(float(majority), 0.5), 0.999)
+    blend = min(max(float(blend), 0.0), 1.0)
+    normal_sigma = max(float(normal_sigma), 1e-6)
+    depth_sigma = max(float(depth_sigma), 1e-6)
+    depth_weight_floor = min(max(float(depth_weight_floor), 0.0), 1.0)
+    min_support = min(max(float(min_support), 0.0), 0.999)
+    threshold = min(max(float(threshold), 0.0), 1.0)
+
+    height, width = score.shape
+    small_size = (
+        max(1, (height + downsample - 1) // downsample),
+        max(1, (width + downsample - 1) // downsample),
+    )
+    small_score = F.interpolate(
+        score[None, None], size=small_size, mode='area'
+    )[0, 0]
+    small_depth = F.interpolate(
+        depth[None, None], size=small_size, mode='area'
+    )[0, 0]
+    small_normal = F.interpolate(
+        normal[None], size=small_size, mode='area'
+    )[0]
+    small_normal = F.normalize(small_normal, dim=0, eps=1e-6)
+
+    small_height, small_width = small_score.shape
+    padded_depth = F.pad(
+        small_depth[None, None], (radius,) * 4, mode='replicate'
+    )
+    padded_normal = F.pad(
+        small_normal[None], (radius,) * 4, mode='replicate'
+    )
+    spatial_sigma_sq = max(float(radius * radius), 1.0)
+    possible_support = 0.0
+    for offset_y in range(-radius, radius + 1):
+        for offset_x in range(-radius, radius + 1):
+            possible_support += math.exp(
+                -(offset_x * offset_x + offset_y * offset_y) /
+                (2.0 * spatial_sigma_sq)
+            )
+
+    original_small_score = small_score
+    consensus_confidence = torch.zeros_like(small_score)
+    for _ in range(iterations):
+        padded_score = F.pad(
+            small_score[None, None], (radius,) * 4, mode='replicate'
+        )
+        support_weight = torch.zeros_like(small_score)
+        high_weight = torch.zeros_like(small_score)
+        high_score_sum = torch.zeros_like(small_score)
+
+        for offset_y in range(-radius, radius + 1):
+            y0 = radius + offset_y
+            for offset_x in range(-radius, radius + 1):
+                x0 = radius + offset_x
+                neighbor_score = padded_score[
+                    0, 0, y0:y0 + small_height, x0:x0 + small_width
+                ]
+                neighbor_depth = padded_depth[
+                    0, 0, y0:y0 + small_height, x0:x0 + small_width
+                ]
+                neighbor_normal = padded_normal[
+                    0, :, y0:y0 + small_height, x0:x0 + small_width
+                ]
+
+                normal_delta = 1.0 - (
+                    small_normal * neighbor_normal
+                ).sum(dim=0).clamp(-1.0, 1.0)
+                depth_delta = (small_depth - neighbor_depth).abs()
+                spatial = math.exp(
+                    -(offset_x * offset_x + offset_y * offset_y) /
+                    (2.0 * spatial_sigma_sq)
+                )
+                normal_weight = torch.exp(-normal_delta / normal_sigma)
+                depth_weight = depth_weight_floor + (1.0 - depth_weight_floor) * torch.exp(
+                    -depth_delta / depth_sigma
+                )
+                plane_weight = spatial * normal_weight * depth_weight
+                is_high = (neighbor_score >= threshold).to(neighbor_score.dtype)
+
+                support_weight += plane_weight
+                high_weight += plane_weight * is_high
+                high_score_sum += plane_weight * is_high * neighbor_score
+
+        high_fraction = high_weight / support_weight.clamp_min(1e-8)
+        support_fraction = support_weight / max(possible_support, 1e-8)
+        has_consensus = (
+            (high_fraction >= majority) &
+            (support_fraction >= min_support)
+        )
+        high_target = high_score_sum / high_weight.clamp_min(1e-8)
+        repair = has_consensus & (small_score < high_target)
+        consensus_confidence = torch.maximum(
+            consensus_confidence,
+            repair.to(small_score.dtype) * high_fraction,
+        )
+        small_score = torch.where(
+            repair,
+            torch.lerp(small_score, high_target, blend),
+            small_score,
+        )
+
+    small_delta = (small_score - original_small_score).clamp_min(0.0)
+    delta = F.interpolate(
+        small_delta[None, None], size=(height, width),
+        mode='bilinear', align_corners=False,
+    )[0, 0]
+    confidence = F.interpolate(
+        consensus_confidence[None, None], size=(height, width),
+        mode='bilinear', align_corners=False,
+    )[0, 0]
+    corrected = (score + delta).clamp(0.0, 1.0)
+    return corrected, delta, confidence
+
+
+def normal_prior_supervision(
+    camera,
+    rendered_world_normal,
+    foreground,
+    surface_alpha,
+    axis_sign=(-1.0, 1.0, 1.0),
+    edge_suppression=2.0,
+    min_alpha=0.05,
+    pool_size=3,
+):
+    """Compare rendered normals with an aligned camera-space normal prior.
+
+    RT-Splatting stores/render normals in world space, while the generated
+    normal maps are camera-space. The same world-to-camera conversion used by
+    mesh visualization is applied here. Truck's priors use the opposite image
+    X convention, represented by the configurable default sign [-1, 1, 1].
+    """
+    prior_camera = camera.load_normal_prior(device=rendered_world_normal.device)
+    if prior_camera is None:
+        return None
+
+    sign = rendered_world_normal.new_tensor([float(value) for value in axis_sign])
+    if sign.numel() != 3:
+        raise ValueError('normal_prior_axis_sign must contain exactly three values')
+    sign = sign.reshape(3, 1, 1)
+    aligned_prior = F.normalize(prior_camera * sign, dim=0, eps=1e-6)
+    rendered_camera = -(
+        rendered_world_normal.movedim(0, -1) @ camera.world_view_transform[:3, :3]
+    ).movedim(-1, 0)
+    rendered_camera = F.normalize(rendered_camera, dim=0, eps=1e-6)
+
+    normal_edge = torch.stack([
+        _sobel_edge(aligned_prior[channel]) for channel in range(3)
+    ]).mean(dim=0, keepdim=True)
+    edge_confidence = torch.exp(-float(edge_suppression) * normal_edge)
+    prior_valid = (
+        aligned_prior.square().sum(dim=0, keepdim=True) > 0.5
+    ).to(aligned_prior.dtype)
+    alpha_confidence = surface_alpha.detach().clamp(0.0, 1.0)
+    alpha_confidence = alpha_confidence * (
+        alpha_confidence >= float(min_alpha)
+    ).to(alpha_confidence.dtype)
+    pixel_confidence = (
+        foreground.detach().clamp(0.0, 1.0) *
+        alpha_confidence * prior_valid * edge_confidence
+    )
+
+    # Compare regional mean directions, not a blurred per-pixel loss. Merely
+    # averaging the scalar loss would leave its global mean almost unchanged.
+    # Pooling the normal vectors first allows local high-frequency detail while
+    # constraining the overall orientation of each overlapping neighborhood.
+    pool_size = max(1, int(pool_size))
+    if pool_size % 2 == 0:
+        pool_size += 1
+    if pool_size > 1:
+        padding = pool_size // 2
+        pooled_confidence = F.avg_pool2d(
+            pixel_confidence[None],
+            kernel_size=pool_size,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )[0]
+        pooled_prior_raw = F.avg_pool2d(
+            (aligned_prior * pixel_confidence)[None],
+            kernel_size=pool_size,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )[0] / pooled_confidence.clamp_min(1e-8)
+        pooled_rendered_raw = F.avg_pool2d(
+            (rendered_camera * pixel_confidence)[None],
+            kernel_size=pool_size,
+            stride=1,
+            padding=padding,
+            count_include_pad=False,
+        )[0] / pooled_confidence.clamp_min(1e-8)
+        pooled_valid = (
+            (pooled_prior_raw.norm(dim=0, keepdim=True) > 0.2) &
+            (pooled_rendered_raw.norm(dim=0, keepdim=True) > 0.2) &
+            (pooled_confidence > 1e-4)
+        ).to(pixel_confidence.dtype)
+        compared_prior = F.normalize(pooled_prior_raw, dim=0, eps=1e-6)
+        compared_rendered = F.normalize(pooled_rendered_raw, dim=0, eps=1e-6)
+        confidence = pooled_confidence * pooled_valid
+    else:
+        compared_prior = aligned_prior
+        compared_rendered = rendered_camera
+        confidence = pixel_confidence
+
+    cosine = (
+        compared_rendered * compared_prior
+    ).sum(dim=0, keepdim=True).clamp(-1.0, 1.0)
+    error = 1.0 - cosine
+    loss = (error * confidence).sum() / confidence.sum().clamp_min(1e-8)
+    return {
+        'loss': loss,
+        'error': error,
+        'confidence': confidence,
+        'prior_camera': aligned_prior,
+        'rendered_camera': rendered_camera,
+        'compared_prior': compared_prior,
+        'compared_rendered': compared_rendered,
+    }
+
+
 @torch.no_grad()
 def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     """Build a per-view 2D glossy probability from RGB/material priors.
@@ -192,7 +446,7 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     score_before_guided = torch.nan_to_num(
         score_before_guided, nan=0.0, posinf=0.0, neginf=0.0
     ).clamp(0.0, 1.0)
-    score = _surface_guided_filter(
+    score_after_guided = _surface_guided_filter(
         score_before_guided,
         depth,
         normal,
@@ -203,12 +457,33 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
         normal_sigma=getattr(opt, 'glossy_guided_normal_sigma', 0.15),
         roughness_sigma=getattr(opt, 'glossy_guided_roughness_sigma', 0.08),
     )
+    score_after_guided = torch.nan_to_num(
+        score_after_guided, nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp(0.0, 1.0)
+    score, plane_consensus_delta, plane_consensus_confidence = _plane_majority_consensus(
+        score_after_guided,
+        depth,
+        normal,
+        threshold=getattr(opt, 'glossy_plane_consensus_threshold', 0.30),
+        downsample=getattr(opt, 'glossy_plane_consensus_downsample', 8),
+        radius=getattr(opt, 'glossy_plane_consensus_radius', 5),
+        iterations=getattr(opt, 'glossy_plane_consensus_iterations', 1),
+        majority=getattr(opt, 'glossy_plane_consensus_majority', 0.60),
+        blend=getattr(opt, 'glossy_plane_consensus_blend', 0.75),
+        normal_sigma=getattr(opt, 'glossy_plane_consensus_normal_sigma', 0.06),
+        depth_sigma=getattr(opt, 'glossy_plane_consensus_depth_sigma', 0.05),
+        depth_weight_floor=getattr(opt, 'glossy_plane_consensus_depth_floor', 0.50),
+        min_support=getattr(opt, 'glossy_plane_consensus_min_support', 0.35),
+    )
     score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
     if not return_details:
         return score
     return {
         'score': score,
         'score_before_guided': score_before_guided,
+        'score_after_guided': score_after_guided,
+        'plane_consensus_delta': plane_consensus_delta,
+        'plane_consensus_confidence': plane_consensus_confidence,
         'wavelet_near': wavelet_near,
         'wavelet_far': wavelet_far,
         'wavelet_adaptive': wavelet_score,

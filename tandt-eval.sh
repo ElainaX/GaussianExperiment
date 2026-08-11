@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_surface_consistent/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_plane_consensus_normal_prior/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -23,6 +23,12 @@ TRAIN_CMD="python train.py \
     --lambda_lpips 0 \
     --lambda_edge_aware 0.1 \
     --edge_aware_from_iter 10000 \
+    --lambda_normal_prior 0.02 \
+    --normal_prior_from_iter 1000 \
+    --normal_prior_warmup_iters 2000 \
+    --normal_prior_axis_sign -1.0 1.0 1.0 \
+    --normal_prior_edge_suppression 2.0 \
+    --normal_prior_pool_size 3 \
     --glossy_prior_on \
     --glossy_from_iter 5000 \
     --glossy_interval 500 \
@@ -34,6 +40,12 @@ TRAIN_CMD="python train.py \
     --glossy_depth_scale_end 0.85 \
     --glossy_guided_filter_radius 1 \
     --glossy_guided_filter_iterations 2 \
+    --glossy_plane_consensus_threshold 0.30 \
+    --glossy_plane_consensus_downsample 8 \
+    --glossy_plane_consensus_radius 5 \
+    --glossy_plane_consensus_majority 0.60 \
+    --glossy_plane_consensus_blend 0.75 \
+    --glossy_plane_consensus_depth_floor 0.50 \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \

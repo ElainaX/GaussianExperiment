@@ -121,6 +121,14 @@ class OptimizationParams(ParamGroup):
         self.dist_loss_from_iter = 0
         self.norm_loss_weight = 0.05
         self.norm_loss_from_iter = 0
+        # Optional supervision from generated camera-space normal priors.
+        self.lambda_normal_prior = 0.0
+        self.normal_prior_from_iter = 1000
+        self.normal_prior_warmup_iters = 2000
+        self.normal_prior_axis_sign = [-1.0, 1.0, 1.0]
+        self.normal_prior_edge_suppression = 2.0
+        self.normal_prior_min_alpha = 0.05
+        self.normal_prior_pool_size = 3
         self.occupancy_decay_weight = 0.001
         self.mask_loss_weight = 0.01
         self.mask_loss_from_iter = -1
@@ -178,6 +186,20 @@ class OptimizationParams(ParamGroup):
         self.glossy_guided_depth_sigma = 0.03
         self.glossy_guided_normal_sigma = 0.15
         self.glossy_guided_roughness_sigma = 0.08
+        # Repair reflection-texture holes using the majority score on a local
+        # normal/depth-consistent plane. Roughness is excluded from membership.
+        # This threshold operates on the pre-color-gate 2D prior and is
+        # therefore intentionally higher than the final Gaussian threshold.
+        self.glossy_plane_consensus_threshold = 0.30
+        self.glossy_plane_consensus_downsample = 8
+        self.glossy_plane_consensus_radius = 5
+        self.glossy_plane_consensus_iterations = 1
+        self.glossy_plane_consensus_majority = 0.60
+        self.glossy_plane_consensus_blend = 0.75
+        self.glossy_plane_consensus_normal_sigma = 0.06
+        self.glossy_plane_consensus_depth_sigma = 0.05
+        self.glossy_plane_consensus_depth_floor = 0.50
+        self.glossy_plane_consensus_min_support = 0.35
         self.glossy_color_var_scale = 20.0
         self.glossy_color_floor = 0.35
         # Correct multi-view RGB variance when the available camera rays span
