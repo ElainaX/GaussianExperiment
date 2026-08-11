@@ -1,3 +1,4 @@
+import math
 import random
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,14 @@ def _normalize01(tensor):
     return (tensor - lo) / (hi - lo + 1e-6)
 
 
+def _smoothstep(tensor, edge0, edge1):
+    """Smoothly map ``tensor`` from [edge0, edge1] to [0, 1]."""
+    edge0 = float(edge0)
+    edge1 = max(float(edge1), edge0 + 1e-6)
+    value = ((tensor - edge0) / (edge1 - edge0)).clamp(0.0, 1.0)
+    return value.square() * (3.0 - 2.0 * value)
+
+
 def _haar_detail(gray_hw, levels=2):
     """Return a normalized multi-level Haar detail-energy map in [0, 1]."""
     height, width = gray_hw.shape
@@ -55,8 +64,76 @@ def _haar_detail(gray_hw, levels=2):
     return _normalize01(detail_full[0, 0])
 
 
+def _surface_guided_filter(
+    score,
+    depth,
+    normal,
+    roughness,
+    radius=1,
+    iterations=1,
+    depth_sigma=0.03,
+    normal_sigma=0.15,
+    roughness_sigma=0.08,
+):
+    """Denoise a score without crossing depth/material boundaries.
+
+    Absolute depth is deliberately not part of the weight.  Only local depth
+    continuity, normal agreement and roughness agreement determine whether two
+    neighboring pixels may exchange evidence.  Consequently a continuous
+    plane is treated consistently even when its camera-space depth changes.
+    """
+    radius = max(0, int(radius))
+    iterations = max(0, int(iterations))
+    if radius == 0 or iterations == 0:
+        return score
+
+    height, width = score.shape
+    depth_sigma = max(float(depth_sigma), 1e-6)
+    normal_sigma = max(float(normal_sigma), 1e-6)
+    roughness_sigma = max(float(roughness_sigma), 1e-6)
+
+    depth_4d = depth[None, None]
+    normal_4d = normal[None]
+    roughness_4d = roughness[None, None]
+    padded_depth = F.pad(depth_4d, (radius,) * 4, mode='replicate')
+    padded_normal = F.pad(normal_4d, (radius,) * 4, mode='replicate')
+    padded_roughness = F.pad(roughness_4d, (radius,) * 4, mode='replicate')
+
+    filtered = score
+    spatial_sigma_sq = max(float(radius * radius), 1.0)
+    for _ in range(iterations):
+        padded_score = F.pad(filtered[None, None], (radius,) * 4, mode='replicate')
+        numerator = torch.zeros_like(filtered)
+        denominator = torch.zeros_like(filtered)
+        for offset_y in range(-radius, radius + 1):
+            y0 = radius + offset_y
+            for offset_x in range(-radius, radius + 1):
+                x0 = radius + offset_x
+                neighbor_score = padded_score[0, 0, y0:y0 + height, x0:x0 + width]
+                neighbor_depth = padded_depth[0, 0, y0:y0 + height, x0:x0 + width]
+                neighbor_normal = padded_normal[0, :, y0:y0 + height, x0:x0 + width]
+                neighbor_roughness = padded_roughness[0, 0, y0:y0 + height, x0:x0 + width]
+
+                depth_delta = (depth - neighbor_depth).abs()
+                normal_delta = 1.0 - (normal * neighbor_normal).sum(dim=0).clamp(-1.0, 1.0)
+                roughness_delta = (roughness - neighbor_roughness).abs()
+                spatial = math.exp(
+                    -(offset_x * offset_x + offset_y * offset_y) /
+                    (2.0 * spatial_sigma_sq)
+                )
+                weight = spatial * torch.exp(
+                    -depth_delta / depth_sigma
+                    -normal_delta / normal_sigma
+                    -roughness_delta / roughness_sigma
+                )
+                numerator += weight * neighbor_score
+                denominator += weight
+        filtered = numerator / denominator.clamp_min(1e-8)
+    return filtered.clamp(0.0, 1.0)
+
+
 @torch.no_grad()
-def build_prior_glossy_map(camera, opt, device='cuda'):
+def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     """Build a per-view 2D glossy probability from RGB/material priors.
 
     Low roughness and Haar/RGB highlight evidence increase the score. Depth and
@@ -76,7 +153,19 @@ def build_prior_glossy_map(camera, opt, device='cuda'):
     normal = priors['normal']
 
     roughness_score = (1.0 - roughness).pow(float(opt.glossy_roughness_power))
-    wavelet_score = _haar_detail(gray, opt.glossy_wavelet_levels).pow(
+    near_levels = int(getattr(opt, 'glossy_wavelet_levels', 2))
+    far_levels = int(getattr(opt, 'glossy_wavelet_far_levels', 4))
+    wavelet_near = _haar_detail(gray, near_levels)
+    wavelet_far = _haar_detail(gray, max(near_levels, far_levels))
+    depth_scale_weight = _smoothstep(
+        depth,
+        getattr(opt, 'glossy_depth_scale_start', 0.35),
+        getattr(opt, 'glossy_depth_scale_end', 0.85),
+    )
+    # Depth changes the image-space receptive field, never the material score
+    # directly.  Far pixels use coarser Haar evidence because the same physical
+    # feature covers fewer pixels there.
+    wavelet_score = torch.lerp(wavelet_near, wavelet_far, depth_scale_weight).pow(
         float(opt.glossy_wavelet_power)
     )
     highlight_score = _normalize01(gray).pow(float(opt.glossy_highlight_power))
@@ -91,8 +180,33 @@ def build_prior_glossy_map(camera, opt, device='cuda'):
     # Low roughness remains the main gate. Haar detail and brightness strengthen
     # the evidence without suppressing broad, smooth reflections entirely.
     appearance_evidence = 0.35 + 0.35 * wavelet_score + 0.30 * highlight_score
-    score = roughness_score * appearance_evidence * geometry_confidence
-    return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    score_before_guided = roughness_score * appearance_evidence * geometry_confidence
+    score_before_guided = torch.nan_to_num(
+        score_before_guided, nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp(0.0, 1.0)
+    score = _surface_guided_filter(
+        score_before_guided,
+        depth,
+        normal,
+        roughness,
+        radius=getattr(opt, 'glossy_guided_filter_radius', 1),
+        iterations=getattr(opt, 'glossy_guided_filter_iterations', 2),
+        depth_sigma=getattr(opt, 'glossy_guided_depth_sigma', 0.03),
+        normal_sigma=getattr(opt, 'glossy_guided_normal_sigma', 0.15),
+        roughness_sigma=getattr(opt, 'glossy_guided_roughness_sigma', 0.08),
+    )
+    score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    if not return_details:
+        return score
+    return {
+        'score': score,
+        'score_before_guided': score_before_guided,
+        'wavelet_near': wavelet_near,
+        'wavelet_far': wavelet_far,
+        'wavelet_adaptive': wavelet_score,
+        'depth_scale_weight': depth_scale_weight,
+        'geometry_confidence': geometry_confidence,
+    }
 
 
 @torch.no_grad()
@@ -114,6 +228,7 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
     total_weight = torch.zeros(num_gaussians, device=device)
     color_sum = torch.zeros(num_gaussians, 3, device=device)
     color_sq_sum = torch.zeros(num_gaussians, 3, device=device)
+    view_direction_sum = torch.zeros(num_gaussians, 3, device=device)
     view_count = torch.zeros(num_gaussians, device=device)
     used_cameras = 0
 
@@ -137,6 +252,10 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
         total_weight += weight
         color_sum[valid] += observation[valid]
         color_sq_sum[valid] += observation[valid].square()
+        visible_directions = F.normalize(
+            camera.camera_center[None] - gaussians.get_xyz[valid], dim=-1, eps=1e-6
+        )
+        view_direction_sum[valid] += visible_directions
         view_count[valid] += 1
         used_cameras += 1
 
@@ -147,7 +266,30 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
     mean_color = color_sum / view_count.clamp_min(1.0)[:, None]
     color_variance = color_sq_sum / view_count.clamp_min(1.0)[:, None] - mean_color.square()
     color_variance = color_variance.clamp_min(0.0).mean(dim=-1)
-    color_score = 1.0 - torch.exp(-float(opt.glossy_color_var_scale) * color_variance)
+    mean_view_direction = view_direction_sum / view_count.clamp_min(1.0)[:, None]
+    # For unit view directions, 1-|mean(d)|^2 is their directional variance.
+    # Distant surfaces commonly have a smaller view-angle baseline, so their
+    # raw RGB variance is corrected for observation geometry rather than being
+    # boosted merely because their depth is large.
+    view_angle_spread = (
+        1.0 - mean_view_direction.square().sum(dim=-1)
+    ).clamp(0.0, 1.0)
+    reference_spread = max(float(getattr(opt, 'glossy_angle_reference_spread', 0.01)), 0.0)
+    max_angle_compensation = max(
+        float(getattr(opt, 'glossy_angle_max_compensation', 4.0)), 1.0
+    )
+    angle_compensation = torch.ones_like(view_angle_spread)
+    enough_angles = view_count >= 2
+    if reference_spread > 0.0 and enough_angles.any():
+        minimum_spread = reference_spread / max_angle_compensation
+        angle_compensation[enough_angles] = (
+            reference_spread /
+            view_angle_spread[enough_angles].clamp_min(minimum_spread)
+        ).clamp(1.0, max_angle_compensation)
+    corrected_color_variance = color_variance * angle_compensation
+    color_score = 1.0 - torch.exp(
+        -float(opt.glossy_color_var_scale) * corrected_color_variance
+    )
     confidence = (view_count / max(1, int(opt.glossy_min_views))).clamp(0.0, 1.0)
     color_gate = float(opt.glossy_color_floor) + (1.0 - float(opt.glossy_color_floor)) * color_score
     fused_score = (prior_score * color_gate * confidence).clamp(0.0, 1.0)
@@ -156,6 +298,9 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
         'fused': fused_score,
         'prior': prior_score,
         'color_variation': color_score,
+        'color_variation_raw': color_variance,
+        'view_angle_spread': view_angle_spread,
+        'angle_compensation': angle_compensation,
         'confidence': confidence,
         'view_count': view_count,
         'used_cameras': used_cameras,

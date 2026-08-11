@@ -346,14 +346,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     visible = glossy_stats['view_count'] > 0
                     mean_score = glossy_stats['fused'][visible].mean().item() if visible.any() else 0.0
                     mean_color = glossy_stats['color_variation'][visible].mean().item() if visible.any() else 0.0
+                    mean_angle = glossy_stats['view_angle_spread'][visible].mean().item() if visible.any() else 0.0
+                    mean_angle_comp = glossy_stats['angle_compensation'][visible].mean().item() if visible.any() else 1.0
                     print(
                         f"[GLOSSY-PRIOR] cameras={glossy_stats['used_cameras']} "
                         f"mean={mean_score:.4f} color-var={mean_color:.4f} "
+                        f"angle-spread={mean_angle:.4f} angle-comp={mean_angle_comp:.3f} "
                         f"selected={glossy_count}/{gaussians.get_xyz.shape[0]}"
                     )
                     if tb_writer:
                         tb_writer.add_scalar('glossy_prior/mean_fused_score', mean_score, iteration)
                         tb_writer.add_scalar('glossy_prior/mean_color_variation', mean_color, iteration)
+                        tb_writer.add_scalar('glossy_prior/mean_view_angle_spread', mean_angle, iteration)
+                        tb_writer.add_scalar('glossy_prior/mean_angle_compensation', mean_angle_comp, iteration)
                         tb_writer.add_scalar('glossy_prior/selected_gaussians', glossy_count, iteration)
 
             if iteration in checkpoint_iterations:

@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_surface_consistent/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -28,6 +28,14 @@ TRAIN_CMD="python train.py \
     --glossy_interval 500 \
     --glossy_num_cams 8 \
     --glossy_min_views 3 \
+    --glossy_wavelet_levels 2 \
+    --glossy_wavelet_far_levels 4 \
+    --glossy_depth_scale_start 0.35 \
+    --glossy_depth_scale_end 0.85 \
+    --glossy_guided_filter_radius 1 \
+    --glossy_guided_filter_iterations 2 \
+    --glossy_angle_reference_spread 0.01 \
+    --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
     --glossy_specular_boost 1.0"
 

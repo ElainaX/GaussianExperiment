@@ -163,11 +163,27 @@ class OptimizationParams(ParamGroup):
         self.glossy_threshold = 0.15
         self.glossy_roughness_power = 2.0
         self.glossy_wavelet_levels = 2
+        # Use a larger image-space wavelet footprint for relatively far pixels.
+        # Depth only interpolates the observation scale; it never boosts the
+        # final material score directly.
+        self.glossy_wavelet_far_levels = 4
+        self.glossy_depth_scale_start = 0.35
+        self.glossy_depth_scale_end = 0.85
         self.glossy_wavelet_power = 1.0
         self.glossy_highlight_power = 1.0
         self.glossy_geometry_suppression = 2.0
+        # Joint depth/normal/roughness filter for surface-consistent 2D scores.
+        self.glossy_guided_filter_radius = 1
+        self.glossy_guided_filter_iterations = 2
+        self.glossy_guided_depth_sigma = 0.03
+        self.glossy_guided_normal_sigma = 0.15
+        self.glossy_guided_roughness_sigma = 0.08
         self.glossy_color_var_scale = 20.0
         self.glossy_color_floor = 0.35
+        # Correct multi-view RGB variance when the available camera rays span
+        # only a small angle (common for far surfaces), with a strict cap.
+        self.glossy_angle_reference_spread = 0.01
+        self.glossy_angle_max_compensation = 4.0
         self.glossy_target_roughness = 0.15
         self.glossy_target_reflectance = 0.70
 

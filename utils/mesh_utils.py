@@ -68,7 +68,7 @@ def to_cam_open3d(viewpoint_stack):
 
 
 class GaussianExtractor(object):
-    def __init__(self, gaussians, render, bg_color):
+    def __init__(self, gaussians, render, bg_color, prior_options=None):
         """
         a class that extracts attributes a scene presented by 2DGS
 
@@ -82,6 +82,7 @@ class GaussianExtractor(object):
         self.background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
         self.gaussians = gaussians
         self.render = render
+        self.prior_options = prior_options
         self.clean()
 
     @torch.no_grad()
@@ -116,6 +117,17 @@ class GaussianExtractor(object):
                 self.rgbmaps.append(rgb.cpu())
                 self.depthmaps.append(render_pkg['surface_depth'].cpu())
                 if export_path is not None:
+                    prior_debug = None
+                    if self.prior_options is not None and viewpoint_cam.has_image_priors:
+                        # Import lazily to avoid coupling mesh extraction to the
+                        # training-only glossy-prior path when no priors exist.
+                        from utils.fast_utils import build_prior_glossy_map
+                        prior_debug = build_prior_glossy_map(
+                            viewpoint_cam,
+                            self.prior_options,
+                            device=rgb.device,
+                            return_details=True,
+                        )
                     gt = viewpoint_cam.original_image
                     mask = viewpoint_cam.gt_transparent_mask.squeeze(0).float()
                     if gt.shape[0] == 4:
@@ -129,6 +141,37 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['glossy_score'][0].cpu().numpy(), os.path.join(vis_path, 'glossy_score_{0:05d}'.format(i) + '.png'))
+                    glossy_threshold = float(getattr(self.prior_options, 'glossy_threshold', 0.15))
+                    executor.submit(
+                        save_img_u8,
+                        (render_pkg['glossy_score'][0] >= glossy_threshold).float().cpu().numpy(),
+                        os.path.join(vis_path, f'glossy_score_mask_{i:05d}.png'),
+                    )
+                    executor.submit(
+                        save_img_u8,
+                        apply_colormap((render_pkg['glossy_score'] / 0.30).clamp(0.0, 1.0))
+                        .permute(1, 2, 0).cpu().numpy(),
+                        os.path.join(vis_path, f'glossy_score_heatmap_{i:05d}.png'),
+                    )
+                    if prior_debug is not None:
+                        debug_names = {
+                            'wavelet_near': 'glossy_wavelet_near',
+                            'wavelet_far': 'glossy_wavelet_far',
+                            'wavelet_adaptive': 'glossy_wavelet_adaptive',
+                            'depth_scale_weight': 'glossy_depth_scale_weight',
+                            'geometry_confidence': 'glossy_geometry_confidence',
+                            'score_before_guided': 'glossy_before_guided',
+                            'score': 'glossy_after_guided',
+                        }
+                        for debug_key, filename_prefix in debug_names.items():
+                            executor.submit(
+                                save_img_u8,
+                                prior_debug[debug_key].cpu().numpy(),
+                                os.path.join(
+                                    vis_path,
+                                    f'{filename_prefix}_{i:05d}.png',
+                                ),
+                            )
                     executor.submit(save_img_u8, render_pkg['transmissivity'][0].cpu().numpy(), os.path.join(vis_path, 'transmissivity_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['attenuation'][0].cpu().numpy(), os.path.join(vis_path, 'attenuation_{0:05d}'.format(i) + '.png'))
 
