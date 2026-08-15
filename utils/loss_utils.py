@@ -28,6 +28,55 @@ def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
 
+def glossy_confidence_gate(score, low=0.08, high=0.20, foreground=None):
+    """Convert a fixed glossy score into a smooth, detached confidence map."""
+    low = float(low)
+    high = max(float(high), low + 1e-6)
+    gate = ((score.detach() - low) / (high - low)).clamp(0.0, 1.0)
+    gate = gate.square() * (3.0 - 2.0 * gate)
+    if foreground is not None:
+        gate = gate * foreground.detach().clamp(0.0, 1.0)
+    return gate
+
+
+def glossy_weighted_l1(network_output, gt, confidence):
+    """RGB L1 normalized by the amount of valid glossy-region support."""
+    confidence = confidence.detach().clamp(0.0, 1.0)
+    weighted_error = (network_output - gt).abs() * confidence
+    denominator = confidence.sum() * network_output.shape[-3]
+    return weighted_error.sum() / denominator.clamp_min(1e-8)
+
+
+def _haar_high_frequency(image):
+    """Return signed LH/HL/HH Haar bands for a CHW image."""
+    height = image.shape[-2] - image.shape[-2] % 2
+    width = image.shape[-1] - image.shape[-1] % 2
+    image = image[..., :height, :width]
+    x00 = image[..., 0::2, 0::2]
+    x01 = image[..., 0::2, 1::2]
+    x10 = image[..., 1::2, 0::2]
+    x11 = image[..., 1::2, 1::2]
+    lh = 0.5 * (x00 + x01 - x10 - x11)
+    hl = 0.5 * (x00 - x01 + x10 - x11)
+    hh = 0.5 * (x00 - x01 - x10 + x11)
+    return torch.cat((lh, hl, hh), dim=-3)
+
+
+def glossy_weighted_haar_loss(network_output, gt, confidence):
+    """Match signed RGB Haar detail only where the glossy prior is confident."""
+    height = network_output.shape[-2] - network_output.shape[-2] % 2
+    width = network_output.shape[-1] - network_output.shape[-1] % 2
+    confidence = confidence.detach()[..., :height, :width].clamp(0.0, 1.0)
+    pooled_confidence = F.avg_pool2d(
+        confidence.unsqueeze(0), kernel_size=2, stride=2
+    ).squeeze(0)
+    output_detail = _haar_high_frequency(network_output)
+    gt_detail = _haar_high_frequency(gt)
+    weighted_error = (output_detail - gt_detail).abs() * pooled_confidence
+    denominator = pooled_confidence.sum() * output_detail.shape[-3]
+    return weighted_error.sum() / denominator.clamp_min(1e-8)
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-((x - window_size // 2) ** 2) / float(2 * sigma**2)) for x in range(window_size)])
     return gauss / gauss.sum()

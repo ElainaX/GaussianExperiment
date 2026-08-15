@@ -30,7 +30,15 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
 )
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
-from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
+from utils.loss_utils import (
+    binary_cross_entropy,
+    glossy_confidence_gate,
+    glossy_weighted_haar_loss,
+    glossy_weighted_l1,
+    l1_loss,
+    lpips,
+    ssim,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -52,6 +60,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for name, value in vars(opt).items():
         if (
             name.startswith('glossy_') or
+            name.startswith('lambda_glossy_') or
             name.startswith('normal_prior_') or
             name == 'lambda_normal_prior'
         ):
@@ -176,6 +185,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_dict['diff'] = loss_diff.item()
         # === 阶段 C：完整 PBR 阶段（>= init_until_iter）===
         else:
+            glossy_gate = glossy_confidence_gate(
+                render_pkg['glossy_score'],
+                low=opt.glossy_render_gate_low,
+                high=opt.glossy_render_gate_high,
+                foreground=foreground,
+            )
+            glossy_guidance_active = (
+                iteration >= opt.glossy_render_loss_from_iter and
+                (
+                    opt.glossy_gradient_routing or
+                    opt.lambda_glossy_rgb > 0 or
+                    opt.lambda_glossy_wavelet > 0
+                )
+            )
             if iteration < opt.mask_loss_from_iter:
                 # mask loss 还没开启，直接用合成图
                 detached_rendering = final_rendering
@@ -184,7 +207,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 防止高光区域的梯度干扰透射分量的学习
                 spec_variance = local_variance(final_spec, weights=1 - surface_opacity.detach())
                 spec_complexity = 1 - torch.exp(-opt.local_var_scale * spec_variance.detach())
-                detached_tran = final_tran.detach() * spec_complexity + final_tran * (1 - spec_complexity)
+                route_gate = spec_complexity
+                if glossy_guidance_active and opt.glossy_gradient_routing:
+                    # Probability-union keeps the original specular-complexity
+                    # routing while also trusting strong persistent glossy
+                    # evidence, even when the current specular render is weak.
+                    route_gate = 1.0 - (1.0 - route_gate) * (1.0 - glossy_gate)
+                detached_tran = final_tran.detach() * route_gate + final_tran * (1 - route_gate)
 
                 detached_rendering = final_scat + detached_tran + final_spec
 
@@ -197,6 +226,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_lpips = opt.lambda_lpips * lpips(detached_rendering, gt_image)
                 loss += loss_lpips
                 loss_dict['lpips'] = loss_lpips.item()
+
+            if glossy_guidance_active:
+                warmup = max(1, int(opt.glossy_render_warmup_iters))
+                glossy_warmup = min(
+                    1.0,
+                    (iteration - opt.glossy_render_loss_from_iter + 1) / warmup,
+                )
+
+                # The forward value equals final_rendering.  Detaching the
+                # unattenuated base appearance routes these auxiliary losses
+                # primarily into attenuation, SphMip/Light-MLP specular,
+                # roughness, reflectance and the normals used by reflection.
+                unattenuated_base = (
+                    render_tran * transmissivity +
+                    render_scat * (1.0 - transmissivity)
+                )
+                glossy_routed_rendering = (
+                    unattenuated_base.detach() * render_pkg['attenuation'] +
+                    final_spec
+                )
+
+                if opt.lambda_glossy_rgb > 0:
+                    glossy_rgb_loss = (
+                        float(opt.lambda_glossy_rgb) * glossy_warmup *
+                        glossy_weighted_l1(
+                            glossy_routed_rendering, gt_image, glossy_gate
+                        )
+                    )
+                    loss += glossy_rgb_loss
+                    loss_dict['glossy_rgb'] = glossy_rgb_loss.item()
+
+                if opt.lambda_glossy_wavelet > 0:
+                    glossy_wavelet_loss = (
+                        float(opt.lambda_glossy_wavelet) * glossy_warmup *
+                        glossy_weighted_haar_loss(
+                            glossy_routed_rendering, gt_image, glossy_gate
+                        )
+                    )
+                    loss += glossy_wavelet_loss
+                    loss_dict['glossy_wavelet'] = glossy_wavelet_loss.item()
 
         # === Occupancy 衰减 loss：惩罚可见高斯的不透明度，鼓励稀疏表示 ===
         if opt.occupancy_decay_weight > 0 and iteration >= opt.init_until_iter:

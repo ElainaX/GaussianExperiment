@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_plane_consensus_normal_prior/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_glossy_guided_render/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -7,7 +7,7 @@ TRAIN_CMD="python train.py \
     --prior_path ~/autodl-tmp/truck/priors \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
-    --env_scope_radius 1000.0 \
+    --env_scope_radius 1 \
     --init_until_iter 700 \
     --norm_loss_from_iter 700 \
     --xyz_axis 2.0 1.0 0.0 \
@@ -23,7 +23,7 @@ TRAIN_CMD="python train.py \
     --lambda_lpips 0 \
     --lambda_edge_aware 0.1 \
     --edge_aware_from_iter 10000 \
-    --lambda_normal_prior 0.02 \
+    --lambda_normal_prior 0 \
     --normal_prior_from_iter 1000 \
     --normal_prior_warmup_iters 2000 \
     --normal_prior_axis_sign -1.0 1.0 1.0 \
@@ -49,6 +49,13 @@ TRAIN_CMD="python train.py \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
+    --lambda_glossy_rgb 0.05 \
+    --lambda_glossy_wavelet 0.01 \
+    --glossy_render_loss_from_iter 10000 \
+    --glossy_render_warmup_iters 3000 \
+    --glossy_render_gate_low 0.08 \
+    --glossy_render_gate_high 0.20 \
+    --glossy_gradient_routing \
     --glossy_specular_boost 1.0"
 
 mkdir -p $MODEL_DIR

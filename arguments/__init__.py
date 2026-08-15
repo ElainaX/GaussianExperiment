@@ -209,6 +209,17 @@ class OptimizationParams(ParamGroup):
         self.glossy_target_roughness = 0.15
         self.glossy_target_reflectance = 0.70
 
+        # Use the persistent glossy score as a detached confidence map for
+        # final-RGB and high-frequency supervision.  Defaults remain disabled
+        # so existing commands/checkpoints preserve their original behavior.
+        self.lambda_glossy_rgb = 0.0
+        self.lambda_glossy_wavelet = 0.0
+        self.glossy_render_loss_from_iter = 10000
+        self.glossy_render_warmup_iters = 3000
+        self.glossy_render_gate_low = 0.08
+        self.glossy_render_gate_high = 0.20
+        self.glossy_gradient_routing = False
+
         self.gsrgb_loss = False
         self.init_until_iter = 0
         self.alpha_until_iter = -1
