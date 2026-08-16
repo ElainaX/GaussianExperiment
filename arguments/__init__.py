@@ -214,11 +214,20 @@ class OptimizationParams(ParamGroup):
         # so existing commands/checkpoints preserve their original behavior.
         self.lambda_glossy_rgb = 0.0
         self.lambda_glossy_wavelet = 0.0
+        self.lambda_glossy_material = 0.0
         self.glossy_render_loss_from_iter = 10000
         self.glossy_render_warmup_iters = 3000
         self.glossy_render_gate_low = 0.08
         self.glossy_render_gate_high = 0.20
         self.glossy_gradient_routing = False
+        # Optional second-stage refinement: keep the reconstructed geometry
+        # and base appearance fixed while optimizing only the reflection field
+        # and its local material parameters.
+        self.glossy_refine_freeze_base = False
+        self.glossy_refine_from_iter = 30000
+        # The old behavior overwrote selected Gaussian material logits every
+        # glossy update. Keep it opt-in; soft material loss is safer.
+        self.glossy_hard_material_promotion = False
 
         self.gsrgb_loss = False
         self.init_until_iter = 0

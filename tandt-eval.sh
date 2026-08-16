@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_glossy_guided_render/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_glossy_refine_stage2/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -49,14 +49,19 @@ TRAIN_CMD="python train.py \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
+    --glossy_target_roughness 0.25 \
+    --glossy_target_reflectance 0.60 \
     --lambda_glossy_rgb 0.05 \
     --lambda_glossy_wavelet 0.01 \
-    --glossy_render_loss_from_iter 10000 \
-    --glossy_render_warmup_iters 3000 \
+    --lambda_glossy_material 0.002 \
+    --glossy_render_loss_from_iter 30000 \
+    --glossy_render_warmup_iters 5000 \
     --glossy_render_gate_low 0.08 \
     --glossy_render_gate_high 0.20 \
     --glossy_gradient_routing \
-    --glossy_specular_boost 1.0"
+    --glossy_refine_freeze_base \
+    --glossy_refine_from_iter 30000 \
+    --glossy_specular_boost 0.0"
 
 mkdir -p $MODEL_DIR
 echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt

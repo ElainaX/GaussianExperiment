@@ -77,6 +77,26 @@ def glossy_weighted_haar_loss(network_output, gt, confidence):
     return weighted_error.sum() / denominator.clamp_min(1e-8)
 
 
+def glossy_weighted_material_loss(
+    roughness,
+    reflectance,
+    confidence,
+    target_roughness=0.15,
+    target_reflectance=0.70,
+):
+    """One-sided soft material prior for confident glossy pixels."""
+    confidence = confidence.detach().clamp(0.0, 1.0)
+    roughness_excess = torch.relu(roughness - float(target_roughness)).square()
+    reflectance_shortfall = torch.relu(
+        float(target_reflectance) - reflectance
+    ).square()
+    weighted_error = (
+        roughness_excess + reflectance_shortfall
+    ) * confidence
+    denominator = confidence.sum() * 2.0
+    return weighted_error.sum() / denominator.clamp_min(1e-8)
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-((x - window_size // 2) ** 2) / float(2 * sigma**2)) for x in range(window_size)])
     return gauss / gauss.sum()

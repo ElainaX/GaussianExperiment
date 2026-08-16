@@ -110,6 +110,7 @@ class GaussianModel:
         self.denom = torch.empty(0)
         self.last_update = torch.empty(0)
         self.optimizer = None
+        self.glossy_refinement_enabled = False
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -328,6 +329,9 @@ class GaussianModel:
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == 'xyz':
+                if self.glossy_refinement_enabled:
+                    param_group['lr'] = 0.0
+                    return 0.0
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
@@ -336,6 +340,31 @@ class GaussianModel:
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == name:
                 param_group['lr'] = lr
+
+    def enable_glossy_refinement(self):
+        """Freeze geometry/base appearance for second-stage reflection fitting."""
+        self.glossy_refinement_enabled = True
+        frozen_parameters = {
+            'xyz': self._xyz,
+            'f_dc': self._features_dc,
+            'f_rest': self._features_rest,
+            'occupancy': self._occupancy,
+            'opacity': self._opacity,
+            'transmissivity': self._transmissivity,
+            'scaling': self._scaling,
+            'rotation': self._rotation,
+        }
+        for parameter in frozen_parameters.values():
+            parameter.requires_grad_(False)
+        for param_group in self.optimizer.param_groups:
+            if param_group['name'] in frozen_parameters:
+                param_group['lr'] = 0.0
+                param_group['params'][0].grad = None
+        trainable_groups = [
+            group['name'] for group in self.optimizer.param_groups
+            if any(parameter.requires_grad for parameter in group['params'])
+        ]
+        return list(frozen_parameters), trainable_groups
 
     def construct_list_of_attributes(self):
         l = [
@@ -876,8 +905,9 @@ class GaussianModel:
         threshold=0.15,
         target_roughness=0.15,
         target_reflectance=0.70,
+        hard_material_promotion=False,
     ):
-        """Update persistent per-Gaussian glossy state and material bounds."""
+        """Update persistent per-Gaussian glossy state and optional bounds."""
         score = torch.nan_to_num(score.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         if score.shape[0] != self.get_xyz.shape[0]:
             raise ValueError(
@@ -896,7 +926,7 @@ class GaussianModel:
         roughness_logit = inverse_sigmoid(torch.tensor(roughness, device=self._roughness.device))
         reflectance_logit = inverse_sigmoid(torch.tensor(reflectance, device=self._reflectance.device))
         mask = self._prior_glossy_score >= float(threshold)
-        if mask.any():
+        if bool(hard_material_promotion) and mask.any():
             self._roughness.data[mask] = torch.minimum(
                 self._roughness.data[mask], roughness_logit.expand_as(self._roughness.data[mask])
             )
