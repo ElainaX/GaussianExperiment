@@ -64,14 +64,17 @@ class ModelParams(ParamGroup):
 
         self.run_dim = 256
         self.rand_init = False
-        # Spatially local cubemap residuals for glossy-region reflections.
+        # Fixed positive-radiance cubemaps captured around glossy regions.
         self.local_probe_on = False
-        self.local_probe_count = 8
-        self.local_probe_resolution = 32
-        self.local_probe_strength = 1.0
-        self.local_probe_max_residual = 0.5
+        self.local_probe_count = 4
+        self.local_probe_resolution = 64
+        self.local_probe_strength = 0.8
+        self.local_probe_radiance_max = 4.0
         self.local_probe_glossy_low = 0.10
         self.local_probe_glossy_high = 0.20
+        self.local_probe_scope_radius = 15.0
+        self.local_probe_surface_offset = 0.25
+        self.local_probe_query_radius = 5.0
 
         self.env_scope_center = [0.0, 0.0, 0.0]
         self.env_scope_radius = 0.0
@@ -211,11 +214,9 @@ class OptimizationParams(ParamGroup):
         # only a small angle (common for far surfaces), with a strict cap.
         self.glossy_angle_reference_spread = 0.01
         self.glossy_angle_max_compensation = 4.0
-        # Initialize local probes once the Gaussian topology and glossy marker
-        # are stable; their residuals are learned by the ordinary RGB loss.
-        self.local_probe_from_iter = 20000
-        self.local_probe_lr = 0.001
-        self.lambda_local_probe_reg = 1e-5
+        # Capture local probes once the Gaussian topology, global radiance and
+        # glossy marker are stable. Captured cubemaps remain fixed afterwards.
+        self.local_probe_from_iter = 30000
 
         self.gsrgb_loss = False
         self.init_until_iter = 0

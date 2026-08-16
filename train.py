@@ -54,7 +54,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             name.startswith('glossy_') or
             name.startswith('local_probe_') or
             name.startswith('normal_prior_') or
-            name in ('lambda_normal_prior', 'lambda_local_probe_reg')
+            name == 'lambda_normal_prior'
         ):
             setattr(dataset, name, value)
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
@@ -106,6 +106,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             raise ValueError('local_probe_from_iter must be smaller than iterations')
         if dataset.local_probe_glossy_high <= dataset.local_probe_glossy_low:
             raise ValueError('local_probe_glossy_high must be greater than local_probe_glossy_low')
+        if dataset.local_probe_query_radius <= 0:
+            raise ValueError('local_probe_query_radius must be positive')
+        if dataset.local_probe_surface_offset < 0:
+            raise ValueError('local_probe_surface_offset cannot be negative')
     ema_loss_dict = {}  # 指数移动平均 loss，用于进度条显示
     progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
     first_iter += 1
@@ -297,18 +301,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += ea_loss
             loss_dict['edge_aware'] = ea_loss.item()
 
-        if (
-            dataset.local_probe_on and
-            gaussians.local_light_probe.is_active and
-            opt.lambda_local_probe_reg > 0
-        ):
-            probe_reg_loss = (
-                float(opt.lambda_local_probe_reg) *
-                gaussians.local_light_probe.regularization()
-            )
-            loss += probe_reg_loss
-            loss_dict['local_probe_reg'] = probe_reg_loss.item()
-
         # ------------------------------------------------------------------
         # 反向传播
         # ------------------------------------------------------------------
@@ -428,18 +420,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dataset.local_probe_on and
                 iteration >= opt.local_probe_from_iter and
                 iteration % opt.glossy_interval == 0 and
-                not gaussians.local_light_probe.is_active
+                not gaussians.local_light_probe.is_initialized
             ):
                 probe_count = gaussians.initialize_local_light_probes(
+                    scene.getTrainCameras(),
                     threshold=opt.glossy_threshold
                 )
                 if probe_count > 0:
+                    capture_stats = capture_local_light_probes(
+                        gaussians,
+                        pipe,
+                        glossy_threshold=opt.glossy_threshold,
+                        output_dir=os.path.join(
+                            scene.model_path,
+                            'probe_cubemaps',
+                            f'iteration_{iteration}',
+                        ),
+                    )
                     print(
-                        f'[LOCAL-PROBE] initialized {probe_count} spatial '
-                        f'cubemaps at iteration {iteration}'
+                        f'[LOCAL-PROBE] captured {probe_count} fixed cubemaps '
+                        f'at iteration {iteration}, '
+                        f'mean-validity={capture_stats["mean_validity"]:.4f}'
                     )
                     if tb_writer:
                         tb_writer.add_scalar('local_probe/active_count', probe_count, iteration)
+                        tb_writer.add_scalar(
+                            'local_probe/mean_validity',
+                            capture_stats['mean_validity'],
+                            iteration,
+                        )
 
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))

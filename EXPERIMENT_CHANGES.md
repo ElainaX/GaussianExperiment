@@ -35,3 +35,15 @@
 - 局部探针由原始最终 RGB 重建 loss 训练，另加很小的 L2 正则，不新增 glossy 专项监督。
 - 新增 `local_probe_gate`、`local_probe_index` 和 `local_probe_correction` 调试图。
 - 使用新的实验目录 `test_priors_local_light_probe`。
+
+## 2026-08-16：固定辐射 Reflection Probe
+
+- 废弃自由学习的 signed cubemap residual；它在车窗上退化成了类似薄膜干涉的彩色误差纹理。
+- 将 Probe 限制在环境中心半径 15 的局部范围，避免最远点采样把探针散到远景。
+- 对高 glossy 高斯做加权空间聚类，并将捕获位置朝最近训练相机外移 0.25。
+- 捕获目标 Probe 时排除该 glossy 区域自身，复用现有渲染器生成六个 90°、64×64 的固定 cubemap。
+- cubemap 保存非负场景辐射和 alpha 有效性；未命中几何的方向继续使用全局 SphMip。
+- 最终镜面改为全局环境与局部 Probe 的能量混合，不再叠加可正可负的学习残差。
+- Probe 在第 30000 次迭代捕获一次，之后保持固定，不接收 RGB loss 梯度。
+- 捕获的六面图和有效性 mask 输出到 `probe_cubemaps/iteration_30000`，便于直接检查是否包含树木/建筑。
+- 新增 `local_probe_radiance` 调试图，实验目录改为 `test_priors_captured_light_probe`。

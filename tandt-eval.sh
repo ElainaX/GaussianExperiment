@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_local_light_probe/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_captured_light_probe/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -50,15 +50,16 @@ TRAIN_CMD="python train.py \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
     --local_probe_on \
-    --local_probe_count 8 \
-    --local_probe_resolution 32 \
-    --local_probe_strength 1.0 \
-    --local_probe_max_residual 0.5 \
+    --local_probe_count 4 \
+    --local_probe_resolution 64 \
+    --local_probe_strength 0.8 \
+    --local_probe_radiance_max 4.0 \
     --local_probe_glossy_low 0.10 \
     --local_probe_glossy_high 0.20 \
-    --local_probe_from_iter 20000 \
-    --local_probe_lr 0.001 \
-    --lambda_local_probe_reg 0.00001"
+    --local_probe_scope_radius 15.0 \
+    --local_probe_surface_offset 0.25 \
+    --local_probe_query_radius 5.0 \
+    --local_probe_from_iter 30000"
 
 mkdir -p $MODEL_DIR
 echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt

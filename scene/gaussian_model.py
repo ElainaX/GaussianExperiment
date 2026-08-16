@@ -127,10 +127,13 @@ class GaussianModel:
         self.local_probe_strength = float(getattr(args, 'local_probe_strength', 1.0))
         self.local_probe_glossy_low = float(getattr(args, 'local_probe_glossy_low', 0.10))
         self.local_probe_glossy_high = float(getattr(args, 'local_probe_glossy_high', 0.20))
+        self.local_probe_scope_radius = float(getattr(args, 'local_probe_scope_radius', 15.0))
+        self.local_probe_surface_offset = float(getattr(args, 'local_probe_surface_offset', 0.25))
+        self.local_probe_query_radius = float(getattr(args, 'local_probe_query_radius', 5.0))
         self.local_light_probe = LocalLightProbe(
-            count=getattr(args, 'local_probe_count', 8),
-            resolution=getattr(args, 'local_probe_resolution', 32),
-            max_residual=getattr(args, 'local_probe_max_residual', 0.5),
+            count=getattr(args, 'local_probe_count', 4),
+            resolution=getattr(args, 'local_probe_resolution', 64),
+            radiance_max=getattr(args, 'local_probe_radiance_max', 4.0),
         ).cuda()
 
         if args.env_scope_radius > 0:
@@ -323,7 +326,6 @@ class GaussianModel:
                 {'params': [self._language_feature], 'lr': training_args.feature_lr, 'name': 'feature'},
                 {'params': list(self.light_mlp.parameters()), 'lr': training_args.mlp_lr, 'name': 'light_mlp'},
                 {'params': list(self.dir_encoding.parameters()), 'lr': training_args.encoding_lr, 'name': 'dir_encoding'},
-                {'params': list(self.local_light_probe.parameters()), 'lr': training_args.local_probe_lr, 'name': 'local_probe'},
             ]
         )
 
@@ -521,13 +523,17 @@ class GaussianModel:
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
         local_probe_path = path.split('point_cloud.ply')[0] + '/local_light_probe.pt'
         if os.path.exists(local_probe_path):
-            self.local_light_probe.load_state_dict(torch.load(local_probe_path))
+            probe_state = torch.load(local_probe_path)
+            if int(probe_state.get('capture_version', torch.tensor(0)).item()) == LocalLightProbe.CAPTURE_VERSION:
+                self.local_light_probe.load_state_dict(probe_state)
+            else:
+                print('[LOCAL-PROBE] ignoring legacy learned-residual probe checkpoint')
         print('Load Path', path)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
+            if group['name'] in ('light_mlp', 'dir_encoding'):
                 continue
 
             if group['name'] == name:
@@ -545,7 +551,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
+            if group['name'] in ('light_mlp', 'dir_encoding'):
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -594,7 +600,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
+            if group['name'] in ('light_mlp', 'dir_encoding'):
                 continue
 
             assert len(group['params']) == 1
@@ -911,14 +917,41 @@ class GaussianModel:
         return int(mask.sum().item())
 
     @torch.no_grad()
-    def initialize_local_light_probes(self, threshold=0.15):
-        """Anchor local cubemaps to spatially separated marked Gaussians."""
-        return self.local_light_probe.initialize_centers(
+    def _local_probe_scope_mask(self):
+        mask = self.get_inside_mask.reshape(-1)
+        if self.local_probe_scope_radius > 0:
+            distance2 = ((self.get_xyz - self.ENV_CENTER) ** 2).sum(dim=-1)
+            mask = mask & (distance2 <= self.local_probe_scope_radius ** 2)
+        return mask
+
+    @torch.no_grad()
+    def initialize_local_light_probes(self, cameras, threshold=0.15):
+        """Cluster marked Gaussians and place cubemap cameras outside them."""
+        camera_centers = torch.stack([camera.camera_center for camera in cameras])
+        return self.local_light_probe.initialize_regions(
             self.get_xyz,
             self._prior_glossy_score,
             threshold=threshold,
-            valid_mask=self.get_inside_mask.reshape(-1),
+            valid_mask=self._local_probe_scope_mask(),
+            camera_centers=camera_centers,
+            surface_offset=self.local_probe_surface_offset,
         )
+
+    @torch.no_grad()
+    def local_probe_capture_keep_mask(self, probe_index, threshold=0.15):
+        """Exclude the target glossy region while capturing its environment."""
+        region, _ = self.local_light_probe.assign_regions(
+            self.get_xyz, initialized=True
+        )
+        exclusion_threshold = min(
+            float(threshold) * 0.8, self.local_probe_glossy_low
+        )
+        target_glossy = (
+            (self._prior_glossy_score >= exclusion_threshold)
+            & self._local_probe_scope_mask()
+            & (region == int(probe_index))
+        )
+        return ~target_glossy
 
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         grads = self.xyz_gradient_accum / self.denom

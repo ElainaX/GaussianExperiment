@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 import torch
@@ -9,7 +10,9 @@ from scene.gaussian_model import GaussianModel
 from utils.camera_utils import *
 from utils.color_utils import *
 from utils.general_utils import *
+from utils.local_light_probe import make_cubemap_camera
 from utils.point_utils import *
+from utils.render_utils import save_img_u8
 from utils.sph_utils import *
 
 
@@ -60,7 +63,9 @@ def accumulate_gaussian_map(viewpoint_camera, pc: GaussianModel, bg_color: torch
     return accumulated, radii > 0
 
 
-def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, metric_map=None, protection_map=None):  # [FASTGS]
+def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
+           scaling_modifier=1.0, metric_map=None, protection_map=None,
+           gaussian_keep_mask=None, disable_local_probe=False):  # [FASTGS]
     """
     Render the scene.
 
@@ -101,6 +106,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     means3D = pc.get_xyz
     means2D = screenspace_points
     occupancy = pc.get_occupancy
+    if gaussian_keep_mask is not None:
+        occupancy = occupancy * gaussian_keep_mask.reshape(-1, 1).to(
+            device=occupancy.device, dtype=occupancy.dtype
+        )
     opacity = pc.get_opacity
     scales = pc.get_scaling
     rotations = pc.get_rotation
@@ -201,6 +210,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     render_spec = torch.zeros(3, image_height, image_width).cuda()
     render_attenuation = torch.zeros(1, image_height, image_width).cuda()
     local_probe_correction = torch.zeros(3, image_height, image_width).cuda()
+    local_probe_radiance = torch.zeros(3, image_height, image_width).cuda()
     local_probe_gate = torch.zeros(1, image_height, image_width).cuda()
     local_probe_index = torch.zeros(1, image_height, image_width).cuda()
 
@@ -239,7 +249,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         spec_light = torch.exp(mlp_output[..., :3] + np.log(0.5))
         spec_attenuation = torch.sigmoid(mlp_output[..., 3:4])
 
-        if pc.local_probe_on and pc.local_light_probe.is_active:
+        if pc.local_probe_on and pc.local_light_probe.is_active and not disable_local_probe:
             glossy_score = render_glossy_score.reshape(-1, 1)[select_index].detach()
             gate_range = max(pc.local_probe_glossy_high - pc.local_probe_glossy_low, 1e-6)
             probe_gate = ((glossy_score - pc.local_probe_glossy_low) / gate_range).clamp(0.0, 1.0)
@@ -248,11 +258,20 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
             # environment; sharp glossy surfaces receive the local correction.
             probe_gate = probe_gate * (1.0 - roughness_map.detach()).square()
             position_map = render_position.movedim(0, -1).reshape(-1, 3)[select_index].detach()
-            probe_residual, probe_id = pc.local_light_probe(position_map, wo)
-            applied_residual = pc.local_probe_strength * probe_gate * probe_residual
-            spec_light = (spec_light + applied_residual).clamp_min(0.0)
-            local_probe_correction.reshape(3, -1)[:, select_index] = applied_residual.transpose(0, 1)
-            local_probe_gate.reshape(1, -1)[:, select_index] = probe_gate.transpose(0, 1)
+            probe_radiance, probe_validity, probe_id, probe_distance = pc.local_light_probe(
+                position_map, wo
+            )
+            spatial_validity = (
+                probe_distance <= pc.local_probe_query_radius
+            ).to(probe_gate.dtype).unsqueeze(-1)
+            probe_gate = probe_gate * probe_validity * spatial_validity
+            blend_weight = (pc.local_probe_strength * probe_gate).clamp(0.0, 1.0)
+            global_spec_light = spec_light
+            spec_light = global_spec_light * (1.0 - blend_weight) + probe_radiance * blend_weight
+            applied_correction = spec_light - global_spec_light
+            local_probe_correction.reshape(3, -1)[:, select_index] = applied_correction.transpose(0, 1)
+            local_probe_radiance.reshape(3, -1)[:, select_index] = probe_radiance.transpose(0, 1)
+            local_probe_gate.reshape(1, -1)[:, select_index] = blend_weight.transpose(0, 1)
             denominator = max(1, int(pc.local_light_probe.active_count.item()) - 1)
             local_probe_index.reshape(1, -1)[:, select_index] = (
                 probe_id.float().unsqueeze(0) / denominator
@@ -286,6 +305,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         'reflectance': render_reflectance,
         'glossy_score': render_glossy_score,
         'local_probe_correction': local_probe_correction,
+        'local_probe_radiance': local_probe_radiance,
         'local_probe_gate': local_probe_gate,
         'local_probe_index': local_probe_index,
         'surface_position': render_position,
@@ -312,3 +332,69 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     }
 
     return rets
+
+
+@torch.no_grad()
+def capture_local_light_probes(pc: GaussianModel, pipe, glossy_threshold=0.15,
+                               output_dir=None):
+    """Render fixed six-face positive-radiance cubemaps for all initialized probes."""
+    count = int(pc.local_light_probe.initialized_count.item())
+    if count == 0:
+        return None
+    background = torch.zeros(3, device=pc.get_xyz.device, dtype=pc.get_xyz.dtype)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    old_init_stage = pipe.init_stage
+    pipe.init_stage = False
+    validity_means = []
+    try:
+        for probe_index in range(count):
+            keep_mask = pc.local_probe_capture_keep_mask(
+                probe_index, threshold=glossy_threshold
+            )
+            center = pc.local_light_probe.capture_positions[probe_index]
+            for face_index in range(6):
+                camera = make_cubemap_camera(
+                    center,
+                    face_index,
+                    pc.local_light_probe.resolution,
+                )
+                render_pkg = render(
+                    camera,
+                    pc,
+                    pipe,
+                    background,
+                    gaussian_keep_mask=keep_mask,
+                    disable_local_probe=True,
+                )
+                radiance = render_pkg['final_rendering'].clamp(
+                    0.0, pc.local_light_probe.radiance_max
+                )
+                validity = render_pkg['surface_alpha'].clamp(0.0, 1.0)
+                pc.local_light_probe.set_face(
+                    probe_index, face_index, radiance, validity
+                )
+                if output_dir:
+                    radiance_vis = radiance / (1.0 + radiance)
+                    save_img_u8(
+                        radiance_vis.permute(1, 2, 0).cpu().numpy(),
+                        os.path.join(
+                            output_dir,
+                            f'probe_{probe_index:02d}_face_{face_index}.png',
+                        ),
+                    )
+                    save_img_u8(
+                        validity[0].cpu().numpy(),
+                        os.path.join(
+                            output_dir,
+                            f'probe_{probe_index:02d}_face_{face_index}_validity.png',
+                        ),
+                    )
+                validity_means.append(float(validity.mean().item()))
+    finally:
+        pipe.init_stage = old_init_stage
+    pc.local_light_probe.activate()
+    return {
+        'probe_count': count,
+        'mean_validity': sum(validity_means) / max(1, len(validity_means)),
+    }
