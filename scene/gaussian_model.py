@@ -18,6 +18,7 @@ from torch import nn
 
 from utils.general_utils import build_rotation, build_scaling_rotation, get_expon_lr_func, inverse_sigmoid
 from utils.graphics_utils import BasicPointCloud
+from utils.local_light_probe import LocalLightProbe
 from utils.sh_utils import RGB2SH
 from utils.sph_utils import *
 from utils.system_utils import mkdir_p
@@ -110,7 +111,6 @@ class GaussianModel:
         self.denom = torch.empty(0)
         self.last_update = torch.empty(0)
         self.optimizer = None
-        self.glossy_refinement_enabled = False
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -121,8 +121,17 @@ class GaussianModel:
 
         # [GLOSSY PRIOR] EMA-fused 2D prior + multi-view color variation.
         self._prior_glossy_score = torch.empty(0)
-        self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 0.0))
         self.glossy_update_count = 0
+
+        self.local_probe_on = bool(getattr(args, 'local_probe_on', False))
+        self.local_probe_strength = float(getattr(args, 'local_probe_strength', 1.0))
+        self.local_probe_glossy_low = float(getattr(args, 'local_probe_glossy_low', 0.10))
+        self.local_probe_glossy_high = float(getattr(args, 'local_probe_glossy_high', 0.20))
+        self.local_light_probe = LocalLightProbe(
+            count=getattr(args, 'local_probe_count', 8),
+            resolution=getattr(args, 'local_probe_resolution', 32),
+            max_residual=getattr(args, 'local_probe_max_residual', 0.5),
+        ).cuda()
 
         if args.env_scope_radius > 0:
             self.ENV_CENTER = torch.tensor([float(c) for c in args.env_scope_center], device='cuda')
@@ -314,6 +323,7 @@ class GaussianModel:
                 {'params': [self._language_feature], 'lr': training_args.feature_lr, 'name': 'feature'},
                 {'params': list(self.light_mlp.parameters()), 'lr': training_args.mlp_lr, 'name': 'light_mlp'},
                 {'params': list(self.dir_encoding.parameters()), 'lr': training_args.encoding_lr, 'name': 'dir_encoding'},
+                {'params': list(self.local_light_probe.parameters()), 'lr': training_args.local_probe_lr, 'name': 'local_probe'},
             ]
         )
 
@@ -329,9 +339,6 @@ class GaussianModel:
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == 'xyz':
-                if self.glossy_refinement_enabled:
-                    param_group['lr'] = 0.0
-                    return 0.0
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
@@ -340,31 +347,6 @@ class GaussianModel:
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == name:
                 param_group['lr'] = lr
-
-    def enable_glossy_refinement(self):
-        """Freeze geometry/base appearance for second-stage reflection fitting."""
-        self.glossy_refinement_enabled = True
-        frozen_parameters = {
-            'xyz': self._xyz,
-            'f_dc': self._features_dc,
-            'f_rest': self._features_rest,
-            'occupancy': self._occupancy,
-            'opacity': self._opacity,
-            'transmissivity': self._transmissivity,
-            'scaling': self._scaling,
-            'rotation': self._rotation,
-        }
-        for parameter in frozen_parameters.values():
-            parameter.requires_grad_(False)
-        for param_group in self.optimizer.param_groups:
-            if param_group['name'] in frozen_parameters:
-                param_group['lr'] = 0.0
-                param_group['params'][0].grad = None
-        trainable_groups = [
-            group['name'] for group in self.optimizer.param_groups
-            if any(parameter.requires_grad for parameter in group['params'])
-        ]
-        return list(frozen_parameters), trainable_groups
 
     def construct_list_of_attributes(self):
         l = [
@@ -431,6 +413,10 @@ class GaussianModel:
 
         torch.save(self.light_mlp, path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         torch.save(self.dir_encoding, path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
+        torch.save(
+            self.local_light_probe.state_dict(),
+            path.split('point_cloud.ply')[0] + '/local_light_probe.pt',
+        )
 
     def reset_occupancy(self):
         self._occupancy.data[torch.isnan(self._occupancy.data.mean(dim=-1))] = 0.0
@@ -533,12 +519,15 @@ class GaussianModel:
 
         self.light_mlp = torch.load(path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
+        local_probe_path = path.split('point_cloud.ply')[0] + '/local_light_probe.pt'
+        if os.path.exists(local_probe_path):
+            self.local_light_probe.load_state_dict(torch.load(local_probe_path))
         print('Load Path', path)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] == 'light_mlp' or group['name'] == 'dir_encoding':
+            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
                 continue
 
             if group['name'] == name:
@@ -556,7 +545,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] == 'light_mlp' or group['name'] == 'dir_encoding':
+            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -605,7 +594,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group['name'] == 'light_mlp' or group['name'] == 'dir_encoding':
+            if group['name'] in ('light_mlp', 'dir_encoding', 'local_probe'):
                 continue
 
             assert len(group['params']) == 1
@@ -903,11 +892,8 @@ class GaussianModel:
         score,
         ema=0.8,
         threshold=0.15,
-        target_roughness=0.15,
-        target_reflectance=0.70,
-        hard_material_promotion=False,
     ):
-        """Update persistent per-Gaussian glossy state and optional bounds."""
+        """Update the persistent marker score without changing PBR material."""
         score = torch.nan_to_num(score.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         if score.shape[0] != self.get_xyz.shape[0]:
             raise ValueError(
@@ -921,19 +907,18 @@ class GaussianModel:
             self._prior_glossy_score.mul_(momentum).add_(score, alpha=1.0 - momentum)
         self.glossy_update_count += 1
 
-        roughness = min(max(float(target_roughness), 1e-4), 1.0 - 1e-4)
-        reflectance = min(max(float(target_reflectance), 1e-4), 1.0 - 1e-4)
-        roughness_logit = inverse_sigmoid(torch.tensor(roughness, device=self._roughness.device))
-        reflectance_logit = inverse_sigmoid(torch.tensor(reflectance, device=self._reflectance.device))
         mask = self._prior_glossy_score >= float(threshold)
-        if bool(hard_material_promotion) and mask.any():
-            self._roughness.data[mask] = torch.minimum(
-                self._roughness.data[mask], roughness_logit.expand_as(self._roughness.data[mask])
-            )
-            self._reflectance.data[mask] = torch.maximum(
-                self._reflectance.data[mask], reflectance_logit.expand_as(self._reflectance.data[mask])
-            )
         return int(mask.sum().item())
+
+    @torch.no_grad()
+    def initialize_local_light_probes(self, threshold=0.15):
+        """Anchor local cubemaps to spatially separated marked Gaussians."""
+        return self.local_light_probe.initialize_centers(
+            self.get_xyz,
+            self._prior_glossy_score,
+            threshold=threshold,
+            valid_mask=self.get_inside_mask.reshape(-1),
+        )
 
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         grads = self.xyz_gradient_accum / self.denom

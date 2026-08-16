@@ -64,9 +64,14 @@ class ModelParams(ParamGroup):
 
         self.run_dim = 256
         self.rand_init = False
-        # Extra specular gain driven by the per-Gaussian glossy prior score.
-        # A score of zero preserves the original RT-Splatting rendering.
-        self.glossy_specular_boost = 1.0
+        # Spatially local cubemap residuals for glossy-region reflections.
+        self.local_probe_on = False
+        self.local_probe_count = 8
+        self.local_probe_resolution = 32
+        self.local_probe_strength = 1.0
+        self.local_probe_max_residual = 0.5
+        self.local_probe_glossy_low = 0.10
+        self.local_probe_glossy_high = 0.20
 
         self.env_scope_center = [0.0, 0.0, 0.0]
         self.env_scope_radius = 0.0
@@ -206,28 +211,11 @@ class OptimizationParams(ParamGroup):
         # only a small angle (common for far surfaces), with a strict cap.
         self.glossy_angle_reference_spread = 0.01
         self.glossy_angle_max_compensation = 4.0
-        self.glossy_target_roughness = 0.15
-        self.glossy_target_reflectance = 0.70
-
-        # Use the persistent glossy score as a detached confidence map for
-        # final-RGB and high-frequency supervision.  Defaults remain disabled
-        # so existing commands/checkpoints preserve their original behavior.
-        self.lambda_glossy_rgb = 0.0
-        self.lambda_glossy_wavelet = 0.0
-        self.lambda_glossy_material = 0.0
-        self.glossy_render_loss_from_iter = 10000
-        self.glossy_render_warmup_iters = 3000
-        self.glossy_render_gate_low = 0.08
-        self.glossy_render_gate_high = 0.20
-        self.glossy_gradient_routing = False
-        # Optional second-stage refinement: keep the reconstructed geometry
-        # and base appearance fixed while optimizing only the reflection field
-        # and its local material parameters.
-        self.glossy_refine_freeze_base = False
-        self.glossy_refine_from_iter = 30000
-        # The old behavior overwrote selected Gaussian material logits every
-        # glossy update. Keep it opt-in; soft material loss is safer.
-        self.glossy_hard_material_promotion = False
+        # Initialize local probes once the Gaussian topology and glossy marker
+        # are stable; their residuals are learned by the ordinary RGB loss.
+        self.local_probe_from_iter = 20000
+        self.local_probe_lr = 0.001
+        self.lambda_local_probe_reg = 1e-5
 
         self.gsrgb_loss = False
         self.init_until_iter = 0

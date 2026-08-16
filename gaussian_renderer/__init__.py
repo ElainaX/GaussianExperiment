@@ -183,6 +183,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
     surface_depth_expected = torch.nan_to_num(surface_depth_expected, 0, 0)
 
     surface_depth = surface_depth_expected * (1 - pipe.depth_ratio) + (pipe.depth_ratio) * surface_depth_median
+    rays_o, viewdirs = camera_rays(viewpoint_camera)
+    render_position = (
+        surface_depth.movedim(0, -1) * viewdirs + rays_o
+    ).movedim(-1, 0)
 
     surface_depth_normal = depth_to_normal_sobel(viewpoint_camera, surface_depth.movedim(0, -1)).movedim(-1, 0)
     surface_depth_normal = surface_depth_normal * surface_alpha.detach()
@@ -196,8 +200,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     render_spec = torch.zeros(3, image_height, image_width).cuda()
     render_attenuation = torch.zeros(1, image_height, image_width).cuda()
+    local_probe_correction = torch.zeros(3, image_height, image_width).cuda()
+    local_probe_gate = torch.zeros(1, image_height, image_width).cuda()
+    local_probe_index = torch.zeros(1, image_height, image_width).cuda()
 
-    _, viewdirs = camera_rays(viewpoint_camera)
     viewdirs = F.normalize(viewdirs, dim=-1)
     normal_map = surface_normal.movedim(0, -1)
     wo = F.normalize(reflect(-viewdirs, normal_map), dim=-1)
@@ -233,6 +239,25 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         spec_light = torch.exp(mlp_output[..., :3] + np.log(0.5))
         spec_attenuation = torch.sigmoid(mlp_output[..., 3:4])
 
+        if pc.local_probe_on and pc.local_light_probe.is_active:
+            glossy_score = render_glossy_score.reshape(-1, 1)[select_index].detach()
+            gate_range = max(pc.local_probe_glossy_high - pc.local_probe_glossy_low, 1e-6)
+            probe_gate = ((glossy_score - pc.local_probe_glossy_low) / gate_range).clamp(0.0, 1.0)
+            probe_gate = probe_gate.square() * (3.0 - 2.0 * probe_gate)
+            # Very rough surfaces should still use the prefiltered global
+            # environment; sharp glossy surfaces receive the local correction.
+            probe_gate = probe_gate * (1.0 - roughness_map.detach()).square()
+            position_map = render_position.movedim(0, -1).reshape(-1, 3)[select_index].detach()
+            probe_residual, probe_id = pc.local_light_probe(position_map, wo)
+            applied_residual = pc.local_probe_strength * probe_gate * probe_residual
+            spec_light = (spec_light + applied_residual).clamp_min(0.0)
+            local_probe_correction.reshape(3, -1)[:, select_index] = applied_residual.transpose(0, 1)
+            local_probe_gate.reshape(1, -1)[:, select_index] = probe_gate.transpose(0, 1)
+            denominator = max(1, int(pc.local_light_probe.active_count.item()) - 1)
+            local_probe_index.reshape(1, -1)[:, select_index] = (
+                probe_id.float().unsqueeze(0) / denominator
+            )
+
         render_spec.reshape(3, -1)[:, select_index] = spec_light.transpose(0, 1)
         render_attenuation.reshape(1, -1)[:, select_index] = spec_attenuation.transpose(0, 1)
 
@@ -240,8 +265,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
 
     final_tran = render_tran * render_transmissivity
     final_scat = render_scat * (1 - render_transmissivity)
-    glossy_gain = 1.0 + pc.glossy_specular_boost * render_glossy_score.clamp(0.0, 1.0)
-    final_spec = render_spec * render_reflectance * glossy_gain
+    final_spec = render_spec * render_reflectance
     final_rendering = final_tran + final_scat
 
     if not pipe.init_stage:
@@ -261,6 +285,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, sc
         'roughness': render_roughness,
         'reflectance': render_reflectance,
         'glossy_score': render_glossy_score,
+        'local_probe_correction': local_probe_correction,
+        'local_probe_gate': local_probe_gate,
+        'local_probe_index': local_probe_index,
+        'surface_position': render_position,
         'transmissivity': render_transmissivity,
         'attenuation': render_attenuation,
         'foreground': foreground,

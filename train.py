@@ -30,16 +30,7 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
 )
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
-from utils.loss_utils import (
-    binary_cross_entropy,
-    glossy_confidence_gate,
-    glossy_weighted_haar_loss,
-    glossy_weighted_l1,
-    glossy_weighted_material_loss,
-    l1_loss,
-    lpips,
-    ssim,
-)
+from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -61,9 +52,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for name, value in vars(opt).items():
         if (
             name.startswith('glossy_') or
-            name.startswith('lambda_glossy_') or
+            name.startswith('local_probe_') or
             name.startswith('normal_prior_') or
-            name == 'lambda_normal_prior'
+            name in ('lambda_normal_prior', 'lambda_local_probe_reg')
         ):
             setattr(dataset, name, value)
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
@@ -103,23 +94,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 'set --prior_path to the mapped prior directory.'
             )
         print(f'[GLOSSY-PRIOR] complete prior views: {prior_views}/{len(viewpoint_stack)}')
-    if opt.glossy_refine_freeze_base:
-        if not opt.glossy_prior_on or not opt.glossy_gradient_routing:
+    if dataset.local_probe_on:
+        if not opt.glossy_prior_on:
+            raise ValueError('--local_probe_on requires --glossy_prior_on')
+        if opt.local_probe_from_iter < opt.densify_until_iter:
             raise ValueError(
-                '--glossy_refine_freeze_base requires both '
-                '--glossy_prior_on and --glossy_gradient_routing'
+                'local_probe_from_iter must be >= densify_until_iter so probe '
+                'regions are classified after Gaussian topology is stable'
             )
-        if opt.glossy_refine_from_iter < opt.densify_until_iter:
-            raise ValueError(
-                'glossy_refine_from_iter must be >= densify_until_iter; '
-                'freezing the Gaussian tensors before densification ends is unsafe'
-            )
-
+        if opt.local_probe_from_iter >= opt.iterations:
+            raise ValueError('local_probe_from_iter must be smaller than iterations')
+        if dataset.local_probe_glossy_high <= dataset.local_probe_glossy_low:
+            raise ValueError('local_probe_glossy_high must be greater than local_probe_glossy_low')
     ema_loss_dict = {}  # 指数移动平均 loss，用于进度条显示
     progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
     first_iter += 1
     last_reset_iter = -100000  # 记录上次 reset occupancy 的迭代，用于 prune 阈值判断
-    glossy_refinement_active = False
     pipe.init_stage = True     # init_stage=True 时渲染管线走简化路径（不含完整 PBR 分解）
 
     # =========================================================================
@@ -130,19 +120,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # 按迭代数衰减各属性的学习率（位置学习率按指数衰减，其他固定）
         gaussians.update_learning_rate(iteration)
-
-        if (
-            opt.glossy_refine_freeze_base and
-            iteration >= opt.glossy_refine_from_iter and
-            not glossy_refinement_active
-        ):
-            frozen_groups, trainable_groups = gaussians.enable_glossy_refinement()
-            glossy_refinement_active = True
-            print(
-                f"[GLOSSY-REFINE] iteration={iteration} "
-                f"frozen={','.join(frozen_groups)} "
-                f"trainable={','.join(trainable_groups)}"
-            )
 
         # Match goodV1_rtsplat-baseline: progressively enable the global SH degree.
         if iteration % 1000 == 0:
@@ -211,21 +188,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_dict['diff'] = loss_diff.item()
         # === 阶段 C：完整 PBR 阶段（>= init_until_iter）===
         else:
-            glossy_gate = glossy_confidence_gate(
-                render_pkg['glossy_score'],
-                low=opt.glossy_render_gate_low,
-                high=opt.glossy_render_gate_high,
-                foreground=foreground,
-            )
-            glossy_guidance_active = (
-                iteration >= opt.glossy_render_loss_from_iter and
-                (
-                    opt.glossy_gradient_routing or
-                    opt.lambda_glossy_rgb > 0 or
-                    opt.lambda_glossy_wavelet > 0 or
-                    opt.lambda_glossy_material > 0
-                )
-            )
             if iteration < opt.mask_loss_from_iter:
                 # mask loss 还没开启，直接用合成图
                 detached_rendering = final_rendering
@@ -234,36 +196,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 防止高光区域的梯度干扰透射分量的学习
                 spec_variance = local_variance(final_spec, weights=1 - surface_opacity.detach())
                 spec_complexity = 1 - torch.exp(-opt.local_var_scale * spec_variance.detach())
-                detached_tran = (
-                    final_tran.detach() * spec_complexity +
-                    final_tran * (1 - spec_complexity)
-                )
+                detached_tran = final_tran.detach() * spec_complexity + final_tran * (1 - spec_complexity)
 
                 detached_rendering = final_scat + detached_tran + final_spec
-                if glossy_guidance_active and opt.glossy_gradient_routing:
-                    # Preserve the exact forward color but freeze both base
-                    # appearance branches inside the glossy auxiliary route.
-                    # Attenuation remains trainable, so it can darken the fixed
-                    # base while the reflection field learns the residual.
-                    unattenuated_base = (
-                        render_tran * transmissivity +
-                        render_scat * (1.0 - transmissivity)
-                    )
-                    glossy_routed_rendering = (
-                        unattenuated_base.detach() * render_pkg['attenuation'] +
-                        final_spec
-                    )
-                    non_glossy_rendering = detached_rendering
-                    if glossy_refinement_active:
-                        # During stage two, losses outside the fixed glossy
-                        # region are monitoring-only constants. Otherwise the
-                        # global reflection MLP would explain residuals from
-                        # the entire truck after the base field is frozen.
-                        non_glossy_rendering = non_glossy_rendering.detach()
-                    detached_rendering = (
-                        non_glossy_rendering * (1.0 - glossy_gate) +
-                        glossy_routed_rendering * glossy_gate
-                    )
 
             loss_pbr = (1.0 - opt.lambda_dssim) * l1_loss(detached_rendering, gt_image) + opt.lambda_dssim * (1.0 - ssim(detached_rendering, gt_image))
             loss += loss_pbr
@@ -274,61 +209,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_lpips = opt.lambda_lpips * lpips(detached_rendering, gt_image)
                 loss += loss_lpips
                 loss_dict['lpips'] = loss_lpips.item()
-
-            if glossy_guidance_active:
-                warmup = max(1, int(opt.glossy_render_warmup_iters))
-                glossy_warmup = min(
-                    1.0,
-                    (iteration - opt.glossy_render_loss_from_iter + 1) / warmup,
-                )
-
-                # The forward value equals final_rendering.  Detaching the
-                # unattenuated base appearance routes these auxiliary losses
-                # primarily into attenuation, SphMip/Light-MLP specular,
-                # roughness and reflectance. During stage two the reflection
-                # normals are fixed, preventing view-specific normal cheating.
-                unattenuated_base = (
-                    render_tran * transmissivity +
-                    render_scat * (1.0 - transmissivity)
-                )
-                glossy_routed_rendering = (
-                    unattenuated_base.detach() * render_pkg['attenuation'] +
-                    final_spec
-                )
-
-                if opt.lambda_glossy_rgb > 0:
-                    glossy_rgb_loss = (
-                        float(opt.lambda_glossy_rgb) * glossy_warmup *
-                        glossy_weighted_l1(
-                            glossy_routed_rendering, gt_image, glossy_gate
-                        )
-                    )
-                    loss += glossy_rgb_loss
-                    loss_dict['glossy_rgb'] = glossy_rgb_loss.item()
-
-                if opt.lambda_glossy_wavelet > 0:
-                    glossy_wavelet_loss = (
-                        float(opt.lambda_glossy_wavelet) * glossy_warmup *
-                        glossy_weighted_haar_loss(
-                            glossy_routed_rendering, gt_image, glossy_gate
-                        )
-                    )
-                    loss += glossy_wavelet_loss
-                    loss_dict['glossy_wavelet'] = glossy_wavelet_loss.item()
-
-                if opt.lambda_glossy_material > 0:
-                    glossy_material_loss = (
-                        float(opt.lambda_glossy_material) * glossy_warmup *
-                        glossy_weighted_material_loss(
-                            render_pkg['roughness'],
-                            render_pkg['reflectance'],
-                            glossy_gate,
-                            target_roughness=opt.glossy_target_roughness,
-                            target_reflectance=opt.glossy_target_reflectance,
-                        )
-                    )
-                    loss += glossy_material_loss
-                    loss_dict['glossy_material'] = glossy_material_loss.item()
 
         # === Occupancy 衰减 loss：惩罚可见高斯的不透明度，鼓励稀疏表示 ===
         if opt.occupancy_decay_weight > 0 and iteration >= opt.init_until_iter:
@@ -411,15 +291,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # === 边缘感知 loss：对齐渲染图与 GT 的「边缘×深度」分布 ===
         if opt.lambda_edge_aware > 0 and iteration >= opt.edge_aware_from_iter:
-            edge_loss_rendering = (
-                detached_rendering if glossy_refinement_active
-                else final_rendering
-            )
             ea_loss = opt.lambda_edge_aware * edge_aware_loss(
-                edge_loss_rendering, gt_image, render_pkg['surface_depth']
+                final_rendering, gt_image, render_pkg['surface_depth']
             )
             loss += ea_loss
             loss_dict['edge_aware'] = ea_loss.item()
+
+        if (
+            dataset.local_probe_on and
+            gaussians.local_light_probe.is_active and
+            opt.lambda_local_probe_reg > 0
+        ):
+            probe_reg_loss = (
+                float(opt.lambda_local_probe_reg) *
+                gaussians.local_light_probe.regularization()
+            )
+            loss += probe_reg_loss
+            loss_dict['local_probe_reg'] = probe_reg_loss.item()
 
         # ------------------------------------------------------------------
         # 反向传播
@@ -517,9 +405,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         glossy_stats['fused'],
                         ema=opt.glossy_ema,
                         threshold=opt.glossy_threshold,
-                        target_roughness=opt.glossy_target_roughness,
-                        target_reflectance=opt.glossy_target_reflectance,
-                        hard_material_promotion=opt.glossy_hard_material_promotion,
                     )
                     visible = glossy_stats['view_count'] > 0
                     mean_score = glossy_stats['fused'][visible].mean().item() if visible.any() else 0.0
@@ -538,6 +423,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar('glossy_prior/mean_view_angle_spread', mean_angle, iteration)
                         tb_writer.add_scalar('glossy_prior/mean_angle_compensation', mean_angle_comp, iteration)
                         tb_writer.add_scalar('glossy_prior/high_score_gaussians', glossy_count, iteration)
+
+            if (
+                dataset.local_probe_on and
+                iteration >= opt.local_probe_from_iter and
+                iteration % opt.glossy_interval == 0 and
+                not gaussians.local_light_probe.is_active
+            ):
+                probe_count = gaussians.initialize_local_light_probes(
+                    threshold=opt.glossy_threshold
+                )
+                if probe_count > 0:
+                    print(
+                        f'[LOCAL-PROBE] initialized {probe_count} spatial '
+                        f'cubemaps at iteration {iteration}'
+                    )
+                    if tb_writer:
+                        tb_writer.add_scalar('local_probe/active_count', probe_count, iteration)
 
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))

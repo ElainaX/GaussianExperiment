@@ -23,3 +23,15 @@
 - 训练日志改用 `high-score`，表示超过阈值但不再代表被强制修改材质。
 - 增加配置检查，禁止在增殖结束前冻结高斯，且精修必须同时启用 glossy prior 与梯度路由。
 - 使用新的实验目录 `test_priors_glossy_refine_stage2`。
+
+## 2026-08-16：局部 Light Probe 二次反射补偿
+
+- 以 2026-08-11 的 SOTA 提交 `8b13988`（`add normal loss`）为代码基线。
+- 回退 glossy RGB/Haar/材质专项监督、梯度路由和第二阶段参数冻结。
+- glossy score 只保留为镜面区域标记，不再直接覆盖 roughness 或 reflectance。
+- 增殖结束后，对高分高斯做空间最远点划分，初始化 8 个离散局部探针。
+- 每个探针使用一个可学习的 32×32 六面 cubemap 残差。
+- 高 glossy score、低 roughness 的像素按空间位置选择最近探针，并按反射方向查询补偿颜色。
+- 局部探针由原始最终 RGB 重建 loss 训练，另加很小的 L2 正则，不新增 glossy 专项监督。
+- 新增 `local_probe_gate`、`local_probe_index` 和 `local_probe_correction` 调试图。
+- 使用新的实验目录 `test_priors_local_light_probe`。

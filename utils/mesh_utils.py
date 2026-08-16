@@ -171,6 +171,10 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, render_pkg['render_scat'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'diffuse_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_spec'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'specular_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['final_spec'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'final_specular_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['local_probe_gate'][0].cpu().numpy(), os.path.join(vis_path, 'local_probe_gate_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['local_probe_index'][0].cpu().numpy(), os.path.join(vis_path, 'local_probe_index_{0:05d}'.format(i) + '.png'))
+                    probe_correction_vis = (render_pkg['local_probe_correction'] + 0.5).clip(0, 1)
+                    executor.submit(save_img_u8, probe_correction_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'local_probe_correction_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_tran'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'transmitted_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))
@@ -186,18 +190,6 @@ class GaussianExtractor(object):
                         apply_colormap((render_pkg['glossy_score'] / 0.30).clamp(0.0, 1.0))
                         .permute(1, 2, 0).cpu().numpy(),
                         os.path.join(vis_path, f'glossy_score_heatmap_{i:05d}.png'),
-                    )
-                    from utils.loss_utils import glossy_confidence_gate
-                    glossy_guidance_gate = glossy_confidence_gate(
-                        render_pkg['glossy_score'],
-                        low=getattr(self.prior_options, 'glossy_render_gate_low', 0.08),
-                        high=getattr(self.prior_options, 'glossy_render_gate_high', 0.20),
-                        foreground=render_pkg['foreground'],
-                    )
-                    executor.submit(
-                        save_img_u8,
-                        glossy_guidance_gate[0].cpu().numpy(),
-                        os.path.join(vis_path, f'glossy_guidance_gate_{i:05d}.png'),
                     )
                     if prior_debug is not None:
                         debug_names = {

@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_glossy_refine_stage2/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_local_light_probe/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -7,7 +7,7 @@ TRAIN_CMD="python train.py \
     --prior_path ~/autodl-tmp/truck/priors \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
-    --env_scope_radius 1 \
+    --env_scope_radius 1000.0 \
     --init_until_iter 700 \
     --norm_loss_from_iter 700 \
     --xyz_axis 2.0 1.0 0.0 \
@@ -49,19 +49,16 @@ TRAIN_CMD="python train.py \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
-    --glossy_target_roughness 0.25 \
-    --glossy_target_reflectance 0.60 \
-    --lambda_glossy_rgb 0.05 \
-    --lambda_glossy_wavelet 0.01 \
-    --lambda_glossy_material 0.002 \
-    --glossy_render_loss_from_iter 30000 \
-    --glossy_render_warmup_iters 5000 \
-    --glossy_render_gate_low 0.08 \
-    --glossy_render_gate_high 0.20 \
-    --glossy_gradient_routing \
-    --glossy_refine_freeze_base \
-    --glossy_refine_from_iter 30000 \
-    --glossy_specular_boost 0.0"
+    --local_probe_on \
+    --local_probe_count 8 \
+    --local_probe_resolution 32 \
+    --local_probe_strength 1.0 \
+    --local_probe_max_residual 0.5 \
+    --local_probe_glossy_low 0.10 \
+    --local_probe_glossy_high 0.20 \
+    --local_probe_from_iter 20000 \
+    --local_probe_lr 0.001 \
+    --lambda_local_probe_reg 0.00001"
 
 mkdir -p $MODEL_DIR
 echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt
