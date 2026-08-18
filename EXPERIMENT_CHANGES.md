@@ -47,3 +47,13 @@
 - Probe 在第 30000 次迭代捕获一次，之后保持固定，不接收 RGB loss 梯度。
 - 捕获的六面图和有效性 mask 输出到 `probe_cubemaps/iteration_30000`，便于直接检查是否包含树木/建筑。
 - 新增 `local_probe_radiance` 调试图，实验目录改为 `test_priors_captured_light_probe`。
+
+## 2026-08-18：SOTA 基线上的 128×128 Reflection Probe 消融
+
+- 严格恢复 2026-08-11 SOTA 提交 `8b13988` 的镜面机制：`glossy_specular_boost=1.0`。
+- 恢复高 glossy 高斯的材质边界：`roughness≤0.15`、`reflectance≥0.70`。
+- Probe 在 SOTA 的全局 SphMip 镜面结果上混合；关闭 Probe 时退化回原 SOTA 渲染公式。
+- 固定 cubemap 从每面 64×64 提高到 128×128，便于检查捕获内容、孔洞和视角错位。
+- 新增推理参数 `--disable_local_probe`，同一 checkpoint 可以直接做 Probe ON/OFF 消融。
+- 新增 `--render_tag`，分别输出 `ours_61000_probe_on` 和 `ours_61000_probe_off`，防止互相覆盖。
+- `tandt-eval.sh` 使用 `env_scope_radius=1`，新实验目录为 `test_priors_sota_captured_probe_128`。

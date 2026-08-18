@@ -12,7 +12,7 @@ class LocalLightProbe(nn.Module):
 
     CAPTURE_VERSION = 2
 
-    def __init__(self, count=4, resolution=64, radiance_max=4.0):
+    def __init__(self, count=4, resolution=128, radiance_max=4.0):
         super().__init__()
         self.count = max(1, int(count))
         self.resolution = max(2, int(resolution))

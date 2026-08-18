@@ -397,6 +397,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         glossy_stats['fused'],
                         ema=opt.glossy_ema,
                         threshold=opt.glossy_threshold,
+                        target_roughness=opt.glossy_target_roughness,
+                        target_reflectance=opt.glossy_target_reflectance,
                     )
                     visible = glossy_stats['view_count'] > 0
                     mean_score = glossy_stats['fused'][visible].mean().item() if visible.any() else 0.0

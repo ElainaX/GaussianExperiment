@@ -249,7 +249,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         spec_light = torch.exp(mlp_output[..., :3] + np.log(0.5))
         spec_attenuation = torch.sigmoid(mlp_output[..., 3:4])
 
-        if pc.local_probe_on and pc.local_light_probe.is_active and not disable_local_probe:
+        probe_disabled = disable_local_probe or getattr(pipe, 'disable_local_probe', False)
+        if pc.local_probe_on and pc.local_light_probe.is_active and not probe_disabled:
             glossy_score = render_glossy_score.reshape(-1, 1)[select_index].detach()
             gate_range = max(pc.local_probe_glossy_high - pc.local_probe_glossy_low, 1e-6)
             probe_gate = ((glossy_score - pc.local_probe_glossy_low) / gate_range).clamp(0.0, 1.0)
@@ -284,7 +285,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
 
     final_tran = render_tran * render_transmissivity
     final_scat = render_scat * (1 - render_transmissivity)
-    final_spec = render_spec * render_reflectance
+    # Preserve the 2026-08-11 SOTA glossy gain. When Probe is disabled,
+    # render_spec is exactly the original global SphMip result.
+    glossy_gain = 1.0 + pc.glossy_specular_boost * render_glossy_score.clamp(0.0, 1.0)
+    final_spec = render_spec * render_reflectance * glossy_gain
     final_rendering = final_tran + final_scat
 
     if not pipe.init_stage:

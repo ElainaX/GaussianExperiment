@@ -1,4 +1,4 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_captured_light_probe/truck
+MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_sota_captured_probe_128/truck
 set -euo pipefail
 
 TRAIN_CMD="python train.py \
@@ -7,7 +7,7 @@ TRAIN_CMD="python train.py \
     --prior_path ~/autodl-tmp/truck/priors \
     --eval \
     --env_scope_center -0.943 -0.083 0.514 \
-    --env_scope_radius 1000.0 \
+    --env_scope_radius 1 \
     --init_until_iter 700 \
     --norm_loss_from_iter 700 \
     --xyz_axis 2.0 1.0 0.0 \
@@ -49,9 +49,12 @@ TRAIN_CMD="python train.py \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
+    --glossy_specular_boost 1.0 \
+    --glossy_target_roughness 0.15 \
+    --glossy_target_reflectance 0.70 \
     --local_probe_on \
     --local_probe_count 4 \
-    --local_probe_resolution 64 \
+    --local_probe_resolution 128 \
     --local_probe_strength 0.8 \
     --local_probe_radiance_max 4.0 \
     --local_probe_glossy_low 0.10 \
@@ -66,6 +69,8 @@ echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt
 
 eval "$TRAIN_CMD"
 
-python render.py -m $MODEL_DIR
+python render.py -m $MODEL_DIR --skip_train --skip_mesh --render_tag probe_on
+
+python render.py -m $MODEL_DIR --skip_train --skip_mesh --disable_local_probe --render_tag probe_off
 
 python metrics.py -m $MODEL_DIR

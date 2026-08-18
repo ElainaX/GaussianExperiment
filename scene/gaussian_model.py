@@ -121,6 +121,7 @@ class GaussianModel:
 
         # [GLOSSY PRIOR] EMA-fused 2D prior + multi-view color variation.
         self._prior_glossy_score = torch.empty(0)
+        self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 1.0))
         self.glossy_update_count = 0
 
         self.local_probe_on = bool(getattr(args, 'local_probe_on', False))
@@ -132,7 +133,7 @@ class GaussianModel:
         self.local_probe_query_radius = float(getattr(args, 'local_probe_query_radius', 5.0))
         self.local_light_probe = LocalLightProbe(
             count=getattr(args, 'local_probe_count', 4),
-            resolution=getattr(args, 'local_probe_resolution', 64),
+            resolution=getattr(args, 'local_probe_resolution', 128),
             radiance_max=getattr(args, 'local_probe_radiance_max', 4.0),
         ).cuda()
 
@@ -898,8 +899,10 @@ class GaussianModel:
         score,
         ema=0.8,
         threshold=0.15,
+        target_roughness=0.15,
+        target_reflectance=0.70,
     ):
-        """Update the persistent marker score without changing PBR material."""
+        """Update the persistent glossy score and enforce SOTA material bounds."""
         score = torch.nan_to_num(score.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         if score.shape[0] != self.get_xyz.shape[0]:
             raise ValueError(
@@ -913,7 +916,18 @@ class GaussianModel:
             self._prior_glossy_score.mul_(momentum).add_(score, alpha=1.0 - momentum)
         self.glossy_update_count += 1
 
+        roughness = min(max(float(target_roughness), 1e-4), 1.0 - 1e-4)
+        reflectance = min(max(float(target_reflectance), 1e-4), 1.0 - 1e-4)
+        roughness_logit = inverse_sigmoid(torch.tensor(roughness, device=self._roughness.device))
+        reflectance_logit = inverse_sigmoid(torch.tensor(reflectance, device=self._reflectance.device))
         mask = self._prior_glossy_score >= float(threshold)
+        if mask.any():
+            self._roughness.data[mask] = torch.minimum(
+                self._roughness.data[mask], roughness_logit.expand_as(self._roughness.data[mask])
+            )
+            self._reflectance.data[mask] = torch.maximum(
+                self._reflectance.data[mask], reflectance_logit.expand_as(self._reflectance.data[mask])
+            )
         return int(mask.sum().item())
 
     @torch.no_grad()

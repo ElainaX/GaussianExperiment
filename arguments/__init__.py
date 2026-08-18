@@ -64,10 +64,13 @@ class ModelParams(ParamGroup):
 
         self.run_dim = 256
         self.rand_init = False
+        # 2026-08-11 SOTA: glossy priors amplify the specular branch while
+        # leaving score-zero pixels identical to the original renderer.
+        self.glossy_specular_boost = 1.0
         # Fixed positive-radiance cubemaps captured around glossy regions.
         self.local_probe_on = False
         self.local_probe_count = 4
-        self.local_probe_resolution = 64
+        self.local_probe_resolution = 128
         self.local_probe_strength = 0.8
         self.local_probe_radiance_max = 4.0
         self.local_probe_glossy_low = 0.10
@@ -97,6 +100,9 @@ class PipelineParams(ParamGroup):
         self.depth_ratio = 0.0
         self.debug = False
         self.init_stage = False
+        # Inference ablation switch. It does not alter or delete captured
+        # cubemaps, so the same checkpoint can be rendered with Probe ON/OFF.
+        self.disable_local_probe = False
         super().__init__(parser, 'Pipeline Parameters')
 
 
@@ -214,6 +220,9 @@ class OptimizationParams(ParamGroup):
         # only a small angle (common for far surfaces), with a strict cap.
         self.glossy_angle_reference_spread = 0.01
         self.glossy_angle_max_compensation = 4.0
+        # 2026-08-11 SOTA material bounds for high-confidence glossy Gaussians.
+        self.glossy_target_roughness = 0.15
+        self.glossy_target_reflectance = 0.70
         # Capture local probes once the Gaussian topology, global radiance and
         # glossy marker are stable. Captured cubemaps remain fixed afterwards.
         self.local_probe_from_iter = 30000
