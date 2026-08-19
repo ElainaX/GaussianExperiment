@@ -1,5 +1,18 @@
-MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_sota_captured_probe_128/truck
 set -euo pipefail
+
+# Keep this tag short and update it whenever the experiment purpose changes.
+EXPERIMENT_NAME="probe"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
+COMMIT_HASH="$(git -C "$SCRIPT_DIR" rev-parse --short=6 HEAD)"
+MODEL_ROOT=~/autodl-tmp/model/rtsplat/tandt
+MODEL_DIR="${MODEL_ROOT}/${EXPERIMENT_NAME}_${COMMIT_DATE}_${COMMIT_HASH}/truck"
+
+if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no)" ]]; then
+    echo "Warning: tracked files contain uncommitted changes; the output tag identifies HEAD only." >&2
+fi
+
+echo "Experiment output: $MODEL_DIR"
 
 # SOTA setting: generated normal priors are debug-only, not a training loss.
 TRAIN_CMD="python train.py \
