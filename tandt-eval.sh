@@ -1,6 +1,7 @@
 MODEL_DIR=~/autodl-tmp/model/rtsplat/tandt/test_priors_sota_captured_probe_128/truck
 set -euo pipefail
 
+# SOTA setting: generated normal priors are debug-only, not a training loss.
 TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/truck \
     -m $MODEL_DIR \

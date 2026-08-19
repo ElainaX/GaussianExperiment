@@ -136,6 +136,8 @@ class OptimizationParams(ParamGroup):
         self.norm_loss_weight = 0.05
         self.norm_loss_from_iter = 0
         # Optional supervision from generated camera-space normal priors.
+        # SOTA/default path keeps this disabled; use an explicit positive
+        # command-line value only for a normal-prior ablation experiment.
         self.lambda_normal_prior = 0.0
         self.normal_prior_from_iter = 1000
         self.normal_prior_warmup_iters = 2000

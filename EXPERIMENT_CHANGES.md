@@ -57,3 +57,9 @@
 - 新增推理参数 `--disable_local_probe`，同一 checkpoint 可以直接做 Probe ON/OFF 消融。
 - 新增 `--render_tag`，分别输出 `ours_61000_probe_on` 和 `ours_61000_probe_off`，防止互相覆盖。
 - `tandt-eval.sh` 使用 `env_scope_radius=1`，新实验目录为 `test_priors_sota_captured_probe_128`。
+
+## 2026-08-18：恢复工作树并固定 SOTA 法线默认值
+
+- 中止误发起的 `git revert 8b13988`，清除 `train.py` 与 `tandt-eval.sh` 的提交冲突，恢复到提交 `3589adc`。
+- 明确将 `lambda_normal_prior=0` 作为默认 SOTA 设置；法线先验只输出诊断图，不参与训练 loss。
+- `tandt-eval.sh` 继续显式传入 `--lambda_normal_prior 0`，需要法线监督时必须手动传入正权重。
