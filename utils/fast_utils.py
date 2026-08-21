@@ -410,9 +410,13 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     # contains ModelParams in existing checkpoints.  Keep every visualization
     # option backward-compatible so an already trained model can be rendered
     # without requiring its OptimizationParams to be present.
+    roughness_threshold = min(max(float(getattr(
+        opt, 'glossy_prior_roughness_threshold', 0.45
+    )), 0.0), 1.0)
+    roughness_gate = (roughness < roughness_threshold).to(roughness.dtype)
     roughness_score = (1.0 - roughness).pow(
         float(getattr(opt, 'glossy_roughness_power', 2.0))
-    )
+    ) * roughness_gate
     near_levels = int(getattr(opt, 'glossy_wavelet_levels', 2))
     far_levels = int(getattr(opt, 'glossy_wavelet_far_levels', 4))
     wavelet_near = _haar_detail(gray, near_levels)
@@ -459,7 +463,7 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     )
     score_after_guided = torch.nan_to_num(
         score_after_guided, nan=0.0, posinf=0.0, neginf=0.0
-    ).clamp(0.0, 1.0)
+    ).clamp(0.0, 1.0) * roughness_gate
     score, plane_consensus_delta, plane_consensus_confidence = _plane_majority_consensus(
         score_after_guided,
         depth,
@@ -475,7 +479,15 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
         depth_weight_floor=getattr(opt, 'glossy_plane_consensus_depth_floor', 0.50),
         min_support=getattr(opt, 'glossy_plane_consensus_min_support', 0.35),
     )
-    score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    # Plane consensus is allowed to repair reflected-texture holes only inside
+    # the material gate. High-roughness pixels remain exactly zero and can
+    # never be accumulated onto a Gaussian by the multi-view rasterizer.
+    score = (
+        torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+        .clamp(0.0, 1.0) * roughness_gate
+    )
+    plane_consensus_delta = plane_consensus_delta * roughness_gate
+    plane_consensus_confidence = plane_consensus_confidence * roughness_gate
     if not return_details:
         return score
     return {
@@ -489,6 +501,7 @@ def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
         'wavelet_adaptive': wavelet_score,
         'depth_scale_weight': depth_scale_weight,
         'geometry_confidence': geometry_confidence,
+        'roughness_gate': roughness_gate,
     }
 
 
@@ -629,7 +642,9 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, sk
     with torch.no_grad():
         for cam in camlist:
             # ── 第一次渲染：得到图像、深度，计算高误差像素和保护权重 ───────────
-            pkg = render(cam, gaussians, pipe, bg)
+            pkg = render(
+                cam, gaussians, pipe, bg, enable_secondary_raytrace=False
+            )
             rendered = pkg['final_rendering']
             gt = cam.original_image.cuda()
 
@@ -654,7 +669,8 @@ def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, sk
             # ── 第二次渲染：传入 metric_map 和 protection_map ─────────────────
             pkg2 = render(cam, gaussians, pipe, bg,
                           metric_map=metric_map,
-                          protection_map=protection_map)
+                          protection_map=protection_map,
+                          enable_secondary_raytrace=False)
             accum_counts      = pkg2['accum_metric_counts']  # [N] int
             accum_protect     = pkg2['accum_protection']     # [N] float
 

@@ -18,7 +18,6 @@ from torch import nn
 
 from utils.general_utils import build_rotation, build_scaling_rotation, get_expon_lr_func, inverse_sigmoid
 from utils.graphics_utils import BasicPointCloud
-from utils.local_light_probe import LocalLightProbe
 from utils.sh_utils import RGB2SH
 from utils.sph_utils import *
 from utils.system_utils import mkdir_p
@@ -124,18 +123,43 @@ class GaussianModel:
         self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 1.0))
         self.glossy_update_count = 0
 
-        self.local_probe_on = bool(getattr(args, 'local_probe_on', False))
-        self.local_probe_strength = float(getattr(args, 'local_probe_strength', 1.0))
-        self.local_probe_glossy_low = float(getattr(args, 'local_probe_glossy_low', 0.10))
-        self.local_probe_glossy_high = float(getattr(args, 'local_probe_glossy_high', 0.20))
-        self.local_probe_scope_radius = float(getattr(args, 'local_probe_scope_radius', 15.0))
-        self.local_probe_surface_offset = float(getattr(args, 'local_probe_surface_offset', 0.25))
-        self.local_probe_query_radius = float(getattr(args, 'local_probe_query_radius', 5.0))
-        self.local_light_probe = LocalLightProbe(
-            count=getattr(args, 'local_probe_count', 4),
-            resolution=getattr(args, 'local_probe_resolution', 128),
-            radiance_max=getattr(args, 'local_probe_radiance_max', 4.0),
-        ).cuda()
+        def optional_arg(name, default):
+            value = getattr(args, name, default)
+            return default if value is None else value
+
+        self.secondary_raytrace_on = bool(
+            optional_arg('secondary_raytrace_on', False)
+        )
+        self.secondary_raytrace_strength = float(
+            optional_arg('secondary_raytrace_strength', 0.8)
+        )
+        self.secondary_raytrace_glossy_low = float(
+            optional_arg('secondary_raytrace_glossy_low', 0.15)
+        )
+        self.secondary_raytrace_glossy_high = float(
+            optional_arg('secondary_raytrace_glossy_high', 0.25)
+        )
+        self.secondary_raytrace_roughness_max = float(
+            optional_arg('secondary_raytrace_roughness_max', 0.25)
+        )
+        self.secondary_raytrace_origin_epsilon = float(
+            optional_arg('secondary_raytrace_origin_epsilon', 0.02)
+        )
+        self.secondary_raytrace_from_iter = int(
+            optional_arg('secondary_raytrace_from_iter', 30000)
+        )
+        self._secondary_raytracer = None
+        self._secondary_raytracer_options = {
+            'thickness_ratio': float(
+                optional_arg('secondary_raytrace_thickness_ratio', 0.10)
+            ),
+            'rebuild_interval': int(
+                optional_arg('secondary_raytrace_rebuild_interval', 1)
+            ),
+            'min_transmittance': float(
+                optional_arg('secondary_raytrace_min_transmittance', 0.03)
+            ),
+        }
 
         if args.env_scope_radius > 0:
             self.ENV_CENTER = torch.tensor([float(c) for c in args.env_scope_center], device='cuda')
@@ -416,10 +440,6 @@ class GaussianModel:
 
         torch.save(self.light_mlp, path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         torch.save(self.dir_encoding, path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
-        torch.save(
-            self.local_light_probe.state_dict(),
-            path.split('point_cloud.ply')[0] + '/local_light_probe.pt',
-        )
 
     def reset_occupancy(self):
         self._occupancy.data[torch.isnan(self._occupancy.data.mean(dim=-1))] = 0.0
@@ -522,13 +542,6 @@ class GaussianModel:
 
         self.light_mlp = torch.load(path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
-        local_probe_path = path.split('point_cloud.ply')[0] + '/local_light_probe.pt'
-        if os.path.exists(local_probe_path):
-            probe_state = torch.load(local_probe_path)
-            if int(probe_state.get('capture_version', torch.tensor(0)).item()) == LocalLightProbe.CAPTURE_VERSION:
-                self.local_light_probe.load_state_dict(probe_state)
-            else:
-                print('[LOCAL-PROBE] ignoring legacy learned-residual probe checkpoint')
         print('Load Path', path)
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -930,42 +943,16 @@ class GaussianModel:
             )
         return int(mask.sum().item())
 
-    @torch.no_grad()
-    def _local_probe_scope_mask(self):
-        mask = self.get_inside_mask.reshape(-1)
-        if self.local_probe_scope_radius > 0:
-            distance2 = ((self.get_xyz - self.ENV_CENTER) ** 2).sum(dim=-1)
-            mask = mask & (distance2 <= self.local_probe_scope_radius ** 2)
-        return mask
-
-    @torch.no_grad()
-    def initialize_local_light_probes(self, cameras, threshold=0.15):
-        """Cluster marked Gaussians and place cubemap cameras outside them."""
-        camera_centers = torch.stack([camera.camera_center for camera in cameras])
-        return self.local_light_probe.initialize_regions(
-            self.get_xyz,
-            self._prior_glossy_score,
-            threshold=threshold,
-            valid_mask=self._local_probe_scope_mask(),
-            camera_centers=camera_centers,
-            surface_offset=self.local_probe_surface_offset,
-        )
-
-    @torch.no_grad()
-    def local_probe_capture_keep_mask(self, probe_index, threshold=0.15):
-        """Exclude the target glossy region while capturing its environment."""
-        region, _ = self.local_light_probe.assign_regions(
-            self.get_xyz, initialized=True
-        )
-        exclusion_threshold = min(
-            float(threshold) * 0.8, self.local_probe_glossy_low
-        )
-        target_glossy = (
-            (self._prior_glossy_score >= exclusion_threshold)
-            & self._local_probe_scope_mask()
-            & (region == int(probe_index))
-        )
-        return ~target_glossy
+    def get_secondary_raytracer(self):
+        """Create the optional 3DGRT backend on first eligible render."""
+        if not self.secondary_raytrace_on:
+            return None
+        if self._secondary_raytracer is None:
+            from secondary_raytracer import ThreeDGRTSecondaryTracer
+            self._secondary_raytracer = ThreeDGRTSecondaryTracer(
+                **self._secondary_raytracer_options
+            )
+        return self._secondary_raytracer
 
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         grads = self.xyz_gradient_accum / self.denom

@@ -1,0 +1,3 @@
+[submodule "submodules/3dgrut"]
+	path = submodules/3dgrut
+	url = https://github.com/nv-tlabs/3dgrut.git

@@ -61,7 +61,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_cluster', default=50, type=int, help='Mesh: number of connected clusters to export')
     parser.add_argument('--unbounded', action='store_true', help='Mesh: using unbounded mode for meshing')
     parser.add_argument('--mesh_res', default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
-    parser.add_argument('--render_tag', default='', type=str, help='Optional safe suffix for output folders, e.g. probe_on or probe_off')
+    parser.add_argument('--render_tag', default='', type=str, help='Optional safe suffix for output folders')
     args = get_combined_args(parser)
     print('Rendering ' + args.model_path)
 
@@ -79,14 +79,11 @@ if __name__ == '__main__':
     method_name = 'ours_{}{}'.format(scene.loaded_iter, output_suffix)
     train_dir = os.path.join(args.model_path, 'train', method_name)
     test_dir = os.path.join(args.model_path, 'test', method_name)
-    probe_available = dataset.local_probe_on and gaussians.local_light_probe.is_active
-    if pipe.disable_local_probe:
-        probe_mode = 'OFF (forced)'
-    elif probe_available:
-        probe_mode = f'ON ({gaussians.local_light_probe.resolution}x{gaussians.local_light_probe.resolution} per face)'
-    else:
-        probe_mode = 'UNAVAILABLE'
-    print(f'Local reflection Probe: {probe_mode}; output method: {method_name}')
+    raytrace_mode = (
+        'OFF (forced)' if pipe.disable_secondary_raytrace else
+        ('ON (3DGRT)' if dataset.secondary_raytrace_on else 'OFF')
+    )
+    print(f'Secondary ray tracing: {raytrace_mode}; output method: {method_name}')
     gaussExtractor = GaussianExtractor(
         gaussians,
         partial(render, pipe=pipe),

@@ -67,17 +67,18 @@ class ModelParams(ParamGroup):
         # 2026-08-11 SOTA: glossy priors amplify the specular branch while
         # leaving score-zero pixels identical to the original renderer.
         self.glossy_specular_boost = 1.0
-        # Fixed positive-radiance cubemaps captured around glossy regions.
-        self.local_probe_on = False
-        self.local_probe_count = 4
-        self.local_probe_resolution = 128
-        self.local_probe_strength = 0.8
-        self.local_probe_radiance_max = 4.0
-        self.local_probe_glossy_low = 0.10
-        self.local_probe_glossy_high = 0.20
-        self.local_probe_scope_radius = 15.0
-        self.local_probe_surface_offset = 0.25
-        self.local_probe_query_radius = 5.0
+        # Optional 3DGRT secondary rays. The primary renderer remains the
+        # diff-surfel rasterizer; only high-glossy, low-roughness pixels trace.
+        self.secondary_raytrace_on = False
+        self.secondary_raytrace_strength = 0.8
+        self.secondary_raytrace_glossy_low = 0.15
+        self.secondary_raytrace_glossy_high = 0.25
+        self.secondary_raytrace_roughness_max = 0.25
+        self.secondary_raytrace_origin_epsilon = 0.02
+        self.secondary_raytrace_thickness_ratio = 0.10
+        self.secondary_raytrace_rebuild_interval = 1
+        self.secondary_raytrace_min_transmittance = 0.03
+        self.secondary_raytrace_from_iter = 30000
 
         self.env_scope_center = [0.0, 0.0, 0.0]
         self.env_scope_radius = 0.0
@@ -100,9 +101,7 @@ class PipelineParams(ParamGroup):
         self.depth_ratio = 0.0
         self.debug = False
         self.init_stage = False
-        # Inference ablation switch. It does not alter or delete captured
-        # cubemaps, so the same checkpoint can be rendered with Probe ON/OFF.
-        self.disable_local_probe = False
+        self.disable_secondary_raytrace = False
         super().__init__(parser, 'Pipeline Parameters')
 
 
@@ -186,6 +185,9 @@ class OptimizationParams(ParamGroup):
         self.glossy_ema = 0.8
         self.glossy_threshold = 0.15
         self.glossy_roughness_power = 2.0
+        # Hard material gate: pixels above this roughness never contribute to
+        # the glossy prior or its later per-Gaussian multi-view accumulation.
+        self.glossy_prior_roughness_threshold = 0.45
         self.glossy_wavelet_levels = 2
         # Use a larger image-space wavelet footprint for relatively far pixels.
         # Depth only interpolates the observation scale; it never boosts the
@@ -225,10 +227,6 @@ class OptimizationParams(ParamGroup):
         # 2026-08-11 SOTA material bounds for high-confidence glossy Gaussians.
         self.glossy_target_roughness = 0.15
         self.glossy_target_reflectance = 0.70
-        # Capture local probes once the Gaussian topology, global radiance and
-        # glossy marker are stable. Captured cubemaps remain fixed afterwards.
-        self.local_probe_from_iter = 30000
-
         self.gsrgb_loss = False
         self.init_until_iter = 0
         self.alpha_until_iter = -1

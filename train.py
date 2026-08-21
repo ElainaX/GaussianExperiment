@@ -52,7 +52,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for name, value in vars(opt).items():
         if (
             name.startswith('glossy_') or
-            name.startswith('local_probe_') or
             name.startswith('normal_prior_') or
             name == 'lambda_normal_prior'
         ):
@@ -94,22 +93,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 'set --prior_path to the mapped prior directory.'
             )
         print(f'[GLOSSY-PRIOR] complete prior views: {prior_views}/{len(viewpoint_stack)}')
-    if dataset.local_probe_on:
+    roughness_threshold = float(opt.glossy_prior_roughness_threshold)
+    if not 0.0 <= roughness_threshold <= 1.0:
+        raise ValueError('glossy_prior_roughness_threshold must be in [0, 1]')
+    if dataset.secondary_raytrace_on:
         if not opt.glossy_prior_on:
-            raise ValueError('--local_probe_on requires --glossy_prior_on')
-        if opt.local_probe_from_iter < opt.densify_until_iter:
+            raise ValueError('--secondary_raytrace_on requires --glossy_prior_on')
+        if dataset.secondary_raytrace_from_iter < opt.densify_until_iter:
             raise ValueError(
-                'local_probe_from_iter must be >= densify_until_iter so probe '
-                'regions are classified after Gaussian topology is stable'
+                'secondary_raytrace_from_iter must be >= densify_until_iter so '
+                'the 3DGRT BVH starts after Gaussian topology is stable'
             )
-        if opt.local_probe_from_iter >= opt.iterations:
-            raise ValueError('local_probe_from_iter must be smaller than iterations')
-        if dataset.local_probe_glossy_high <= dataset.local_probe_glossy_low:
-            raise ValueError('local_probe_glossy_high must be greater than local_probe_glossy_low')
-        if dataset.local_probe_query_radius <= 0:
-            raise ValueError('local_probe_query_radius must be positive')
-        if dataset.local_probe_surface_offset < 0:
-            raise ValueError('local_probe_surface_offset cannot be negative')
+        if dataset.secondary_raytrace_from_iter >= opt.iterations:
+            raise ValueError('secondary_raytrace_from_iter must be smaller than iterations')
+        if dataset.secondary_raytrace_glossy_high <= dataset.secondary_raytrace_glossy_low:
+            raise ValueError(
+                'secondary_raytrace_glossy_high must be greater than '
+                'secondary_raytrace_glossy_low'
+            )
+        if not 0.0 <= dataset.secondary_raytrace_roughness_max <= 1.0:
+            raise ValueError('secondary_raytrace_roughness_max must be in [0, 1]')
+        if dataset.secondary_raytrace_origin_epsilon < 0.0:
+            raise ValueError('secondary_raytrace_origin_epsilon cannot be negative')
     ema_loss_dict = {}  # 指数移动平均 loss，用于进度条显示
     progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
     first_iter += 1
@@ -120,6 +125,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 阶段③：主训练循环
     # =========================================================================
     for iteration in range(first_iter, opt.iterations + 1):
+        pipe.training_iteration = iteration
         iter_start.record()
 
         # 按迭代数衰减各属性的学习率（位置学习率按指数衰减，其他固定）
@@ -417,40 +423,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar('glossy_prior/mean_view_angle_spread', mean_angle, iteration)
                         tb_writer.add_scalar('glossy_prior/mean_angle_compensation', mean_angle_comp, iteration)
                         tb_writer.add_scalar('glossy_prior/high_score_gaussians', glossy_count, iteration)
-
-            if (
-                dataset.local_probe_on and
-                iteration >= opt.local_probe_from_iter and
-                iteration % opt.glossy_interval == 0 and
-                not gaussians.local_light_probe.is_initialized
-            ):
-                probe_count = gaussians.initialize_local_light_probes(
-                    scene.getTrainCameras(),
-                    threshold=opt.glossy_threshold
-                )
-                if probe_count > 0:
-                    capture_stats = capture_local_light_probes(
-                        gaussians,
-                        pipe,
-                        glossy_threshold=opt.glossy_threshold,
-                        output_dir=os.path.join(
-                            scene.model_path,
-                            'probe_cubemaps',
-                            f'iteration_{iteration}',
-                        ),
-                    )
-                    print(
-                        f'[LOCAL-PROBE] captured {probe_count} fixed cubemaps '
-                        f'at iteration {iteration}, '
-                        f'mean-validity={capture_stats["mean_validity"]:.4f}'
-                    )
-                    if tb_writer:
-                        tb_writer.add_scalar('local_probe/active_count', probe_count, iteration)
-                        tb_writer.add_scalar(
-                            'local_probe/mean_validity',
-                            capture_stats['mean_validity'],
-                            iteration,
-                        )
 
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))

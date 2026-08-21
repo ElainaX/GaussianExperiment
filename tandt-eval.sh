@@ -1,8 +1,9 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="probe"
+EXPERIMENT_NAME="raytrace"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
 COMMIT_HASH="$(git -C "$SCRIPT_DIR" rev-parse --short=6 HEAD)"
 MODEL_ROOT=~/autodl-tmp/model/rtsplat/tandt
@@ -13,6 +14,12 @@ if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no)" ]]; t
 fi
 
 echo "Experiment output: $MODEL_DIR"
+
+# Fail before the long training run if the pinned official CUDA/OptiX backend
+# or its OptiX headers are unavailable.
+git -C "$SCRIPT_DIR" submodule update --init submodules/3dgrut
+git -C "$SCRIPT_DIR/submodules/3dgrut" submodule update --init threedgrt_tracer/dependencies/optix-dev
+python -m secondary_raytracer.build_3dgrt
 
 # SOTA setting: generated normal priors are debug-only, not a training loss.
 TRAIN_CMD="python train.py \
@@ -63,28 +70,26 @@ TRAIN_CMD="python train.py \
     --glossy_angle_reference_spread 0.01 \
     --glossy_angle_max_compensation 4.0 \
     --glossy_threshold 0.15 \
+    --glossy_prior_roughness_threshold 0.45 \
     --glossy_specular_boost 1.0 \
     --glossy_target_roughness 0.15 \
     --glossy_target_reflectance 0.70 \
-    --local_probe_on \
-    --local_probe_count 4 \
-    --local_probe_resolution 128 \
-    --local_probe_strength 0.8 \
-    --local_probe_radiance_max 4.0 \
-    --local_probe_glossy_low 0.10 \
-    --local_probe_glossy_high 0.20 \
-    --local_probe_scope_radius 15.0 \
-    --local_probe_surface_offset 0.25 \
-    --local_probe_query_radius 5.0 \
-    --local_probe_from_iter 30000"
+    --secondary_raytrace_on \
+    --secondary_raytrace_strength 0.8 \
+    --secondary_raytrace_glossy_low 0.15 \
+    --secondary_raytrace_glossy_high 0.25 \
+    --secondary_raytrace_roughness_max 0.25 \
+    --secondary_raytrace_origin_epsilon 0.02 \
+    --secondary_raytrace_thickness_ratio 0.10 \
+    --secondary_raytrace_rebuild_interval 1 \
+    --secondary_raytrace_min_transmittance 0.03 \
+    --secondary_raytrace_from_iter 30000"
 
-mkdir -p $MODEL_DIR
-echo "$TRAIN_CMD" > $MODEL_DIR/train_cmd.txt
+mkdir -p "$MODEL_DIR"
+echo "$TRAIN_CMD" > "$MODEL_DIR/train_cmd.txt"
 
 eval "$TRAIN_CMD"
 
-python render.py -m $MODEL_DIR --skip_train --skip_mesh --render_tag probe_on
+python render.py -m "$MODEL_DIR" --skip_train --skip_mesh
 
-python render.py -m $MODEL_DIR --skip_train --skip_mesh --disable_local_probe --render_tag probe_off
-
-python metrics.py -m $MODEL_DIR
+python metrics.py -m "$MODEL_DIR"

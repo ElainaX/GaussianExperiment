@@ -171,13 +171,11 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, render_pkg['render_scat'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'diffuse_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_spec'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'specular_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['final_spec'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'final_specular_{0:05d}'.format(i) + '.png'))
-                    executor.submit(save_img_u8, render_pkg['local_probe_gate'][0].cpu().numpy(), os.path.join(vis_path, 'local_probe_gate_{0:05d}'.format(i) + '.png'))
-                    executor.submit(save_img_u8, render_pkg['local_probe_index'][0].cpu().numpy(), os.path.join(vis_path, 'local_probe_index_{0:05d}'.format(i) + '.png'))
-                    probe_radiance_vis = render_pkg['local_probe_radiance'].clamp_min(0)
-                    probe_radiance_vis = probe_radiance_vis / (1.0 + probe_radiance_vis)
-                    executor.submit(save_img_u8, probe_radiance_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'local_probe_radiance_{0:05d}'.format(i) + '.png'))
-                    probe_correction_vis = (render_pkg['local_probe_correction'] * 0.25 + 0.5).clip(0, 1)
-                    executor.submit(save_img_u8, probe_correction_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'local_probe_correction_{0:05d}'.format(i) + '.png'))
+                    secondary_radiance_vis = render_pkg['secondary_raytrace_radiance'].clamp_min(0)
+                    secondary_radiance_vis = secondary_radiance_vis / (1.0 + secondary_radiance_vis)
+                    executor.submit(save_img_u8, secondary_radiance_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_radiance_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['secondary_raytrace_gate'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_gate_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['secondary_raytrace_hit_opacity'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_hit_opacity_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_tran'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'transmitted_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))
@@ -201,6 +199,7 @@ class GaussianExtractor(object):
                             'wavelet_adaptive': 'glossy_wavelet_adaptive',
                             'depth_scale_weight': 'glossy_depth_scale_weight',
                             'geometry_confidence': 'glossy_geometry_confidence',
+                            'roughness_gate': 'glossy_roughness_gate',
                             'score_before_guided': 'glossy_before_guided',
                             'score_after_guided': 'glossy_after_guided',
                             'plane_consensus_delta': 'glossy_plane_consensus_delta_x10',

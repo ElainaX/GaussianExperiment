@@ -1,5 +1,4 @@
 import math
-import os
 
 import numpy as np
 import torch
@@ -10,9 +9,7 @@ from scene.gaussian_model import GaussianModel
 from utils.camera_utils import *
 from utils.color_utils import *
 from utils.general_utils import *
-from utils.local_light_probe import make_cubemap_camera
 from utils.point_utils import *
-from utils.render_utils import save_img_u8
 from utils.sph_utils import *
 
 
@@ -65,7 +62,7 @@ def accumulate_gaussian_map(viewpoint_camera, pc: GaussianModel, bg_color: torch
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
            scaling_modifier=1.0, metric_map=None, protection_map=None,
-           gaussian_keep_mask=None, disable_local_probe=False):  # [FASTGS]
+           enable_secondary_raytrace=True):  # [FASTGS]
     """
     Render the scene.
 
@@ -106,10 +103,6 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     means3D = pc.get_xyz
     means2D = screenspace_points
     occupancy = pc.get_occupancy
-    if gaussian_keep_mask is not None:
-        occupancy = occupancy * gaussian_keep_mask.reshape(-1, 1).to(
-            device=occupancy.device, dtype=occupancy.dtype
-        )
     opacity = pc.get_opacity
     scales = pc.get_scaling
     rotations = pc.get_rotation
@@ -209,10 +202,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
 
     render_spec = torch.zeros(3, image_height, image_width).cuda()
     render_attenuation = torch.zeros(1, image_height, image_width).cuda()
-    local_probe_correction = torch.zeros(3, image_height, image_width).cuda()
-    local_probe_radiance = torch.zeros(3, image_height, image_width).cuda()
-    local_probe_gate = torch.zeros(1, image_height, image_width).cuda()
-    local_probe_index = torch.zeros(1, image_height, image_width).cuda()
+    secondary_radiance = torch.zeros(3, image_height, image_width).cuda()
+    secondary_gate = torch.zeros(1, image_height, image_width).cuda()
+    secondary_hit_opacity = torch.zeros(1, image_height, image_width).cuda()
 
     viewdirs = F.normalize(viewdirs, dim=-1)
     normal_map = surface_normal.movedim(0, -1)
@@ -249,34 +241,71 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         spec_light = torch.exp(mlp_output[..., :3] + np.log(0.5))
         spec_attenuation = torch.sigmoid(mlp_output[..., 3:4])
 
-        probe_disabled = disable_local_probe or getattr(pipe, 'disable_local_probe', False)
-        if pc.local_probe_on and pc.local_light_probe.is_active and not probe_disabled:
+        training_iteration = getattr(pipe, 'training_iteration', None)
+        raytrace_ready = (
+            pc.secondary_raytrace_on and
+            enable_secondary_raytrace and
+            not getattr(pipe, 'disable_secondary_raytrace', False) and
+            (
+                training_iteration is None or
+                training_iteration >= pc.secondary_raytrace_from_iter
+            )
+        )
+        if raytrace_ready:
             glossy_score = render_glossy_score.reshape(-1, 1)[select_index].detach()
-            gate_range = max(pc.local_probe_glossy_high - pc.local_probe_glossy_low, 1e-6)
-            probe_gate = ((glossy_score - pc.local_probe_glossy_low) / gate_range).clamp(0.0, 1.0)
-            probe_gate = probe_gate.square() * (3.0 - 2.0 * probe_gate)
-            # Very rough surfaces should still use the prefiltered global
-            # environment; sharp glossy surfaces receive the local correction.
-            probe_gate = probe_gate * (1.0 - roughness_map.detach()).square()
-            position_map = render_position.movedim(0, -1).reshape(-1, 3)[select_index].detach()
-            probe_radiance, probe_validity, probe_id, probe_distance = pc.local_light_probe(
-                position_map, wo
+            gate_range = max(
+                pc.secondary_raytrace_glossy_high -
+                pc.secondary_raytrace_glossy_low,
+                1e-6,
             )
-            spatial_validity = (
-                probe_distance <= pc.local_probe_query_radius
-            ).to(probe_gate.dtype).unsqueeze(-1)
-            probe_gate = probe_gate * probe_validity * spatial_validity
-            blend_weight = (pc.local_probe_strength * probe_gate).clamp(0.0, 1.0)
-            global_spec_light = spec_light
-            spec_light = global_spec_light * (1.0 - blend_weight) + probe_radiance * blend_weight
-            applied_correction = spec_light - global_spec_light
-            local_probe_correction.reshape(3, -1)[:, select_index] = applied_correction.transpose(0, 1)
-            local_probe_radiance.reshape(3, -1)[:, select_index] = probe_radiance.transpose(0, 1)
-            local_probe_gate.reshape(1, -1)[:, select_index] = blend_weight.transpose(0, 1)
-            denominator = max(1, int(pc.local_light_probe.active_count.item()) - 1)
-            local_probe_index.reshape(1, -1)[:, select_index] = (
-                probe_id.float().unsqueeze(0) / denominator
-            )
+            ray_gate = (
+                (glossy_score - pc.secondary_raytrace_glossy_low) / gate_range
+            ).clamp(0.0, 1.0)
+            ray_gate = ray_gate.square() * (3.0 - 2.0 * ray_gate)
+            ray_gate = ray_gate * (
+                roughness_map.detach() <= pc.secondary_raytrace_roughness_max
+            ).to(ray_gate.dtype)
+            ray_local_index = (ray_gate[:, 0] > 0.0).nonzero(
+                as_tuple=True
+            )[0]
+            if ray_local_index.numel() > 0:
+                position_map = render_position.movedim(0, -1).reshape(
+                    -1, 3
+                )[select_index]
+                trace_directions = wo[ray_local_index]
+                trace_origins = (
+                    position_map[ray_local_index] +
+                    pc.secondary_raytrace_origin_epsilon * trace_directions
+                )
+                ray_radiance, ray_opacity = pc.get_secondary_raytracer().trace(
+                    pc, trace_origins, trace_directions
+                )
+                material_weight = (
+                    pc.secondary_raytrace_strength *
+                    ray_gate[ray_local_index]
+                ).clamp(0.0, 1.0)
+                global_spec_light = spec_light[ray_local_index]
+                # 3DGRT returns radiance composited over black. Preserve the
+                # existing SphMip environment for the unoccluded transmittance
+                # instead of multiplying the traced radiance by alpha twice.
+                traced_spec_light = (
+                    ray_radiance + global_spec_light * (1.0 - ray_opacity)
+                )
+                spec_light = spec_light.clone()
+                spec_light[ray_local_index] = (
+                    global_spec_light * (1.0 - material_weight) +
+                    traced_spec_light * material_weight
+                )
+                pixel_index = select_index[ray_local_index]
+                secondary_radiance.reshape(3, -1)[:, pixel_index] = (
+                    ray_radiance.transpose(0, 1)
+                )
+                secondary_gate.reshape(1, -1)[:, pixel_index] = (
+                    (material_weight * ray_opacity).transpose(0, 1)
+                )
+                secondary_hit_opacity.reshape(1, -1)[:, pixel_index] = (
+                    ray_opacity.transpose(0, 1)
+                )
 
         render_spec.reshape(3, -1)[:, select_index] = spec_light.transpose(0, 1)
         render_attenuation.reshape(1, -1)[:, select_index] = spec_attenuation.transpose(0, 1)
@@ -285,7 +314,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
 
     final_tran = render_tran * render_transmissivity
     final_scat = render_scat * (1 - render_transmissivity)
-    # Preserve the 2026-08-11 SOTA glossy gain. When Probe is disabled,
+    # Preserve the 2026-08-11 SOTA glossy gain. With secondary tracing off,
     # render_spec is exactly the original global SphMip result.
     glossy_gain = 1.0 + pc.glossy_specular_boost * render_glossy_score.clamp(0.0, 1.0)
     final_spec = render_spec * render_reflectance * glossy_gain
@@ -308,10 +337,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         'roughness': render_roughness,
         'reflectance': render_reflectance,
         'glossy_score': render_glossy_score,
-        'local_probe_correction': local_probe_correction,
-        'local_probe_radiance': local_probe_radiance,
-        'local_probe_gate': local_probe_gate,
-        'local_probe_index': local_probe_index,
+        'secondary_raytrace_radiance': secondary_radiance,
+        'secondary_raytrace_gate': secondary_gate,
+        'secondary_raytrace_hit_opacity': secondary_hit_opacity,
         'surface_position': render_position,
         'transmissivity': render_transmissivity,
         'attenuation': render_attenuation,
@@ -336,69 +364,3 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     }
 
     return rets
-
-
-@torch.no_grad()
-def capture_local_light_probes(pc: GaussianModel, pipe, glossy_threshold=0.15,
-                               output_dir=None):
-    """Render fixed six-face positive-radiance cubemaps for all initialized probes."""
-    count = int(pc.local_light_probe.initialized_count.item())
-    if count == 0:
-        return None
-    background = torch.zeros(3, device=pc.get_xyz.device, dtype=pc.get_xyz.dtype)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    old_init_stage = pipe.init_stage
-    pipe.init_stage = False
-    validity_means = []
-    try:
-        for probe_index in range(count):
-            keep_mask = pc.local_probe_capture_keep_mask(
-                probe_index, threshold=glossy_threshold
-            )
-            center = pc.local_light_probe.capture_positions[probe_index]
-            for face_index in range(6):
-                camera = make_cubemap_camera(
-                    center,
-                    face_index,
-                    pc.local_light_probe.resolution,
-                )
-                render_pkg = render(
-                    camera,
-                    pc,
-                    pipe,
-                    background,
-                    gaussian_keep_mask=keep_mask,
-                    disable_local_probe=True,
-                )
-                radiance = render_pkg['final_rendering'].clamp(
-                    0.0, pc.local_light_probe.radiance_max
-                )
-                validity = render_pkg['surface_alpha'].clamp(0.0, 1.0)
-                pc.local_light_probe.set_face(
-                    probe_index, face_index, radiance, validity
-                )
-                if output_dir:
-                    radiance_vis = radiance / (1.0 + radiance)
-                    save_img_u8(
-                        radiance_vis.permute(1, 2, 0).cpu().numpy(),
-                        os.path.join(
-                            output_dir,
-                            f'probe_{probe_index:02d}_face_{face_index}.png',
-                        ),
-                    )
-                    save_img_u8(
-                        validity[0].cpu().numpy(),
-                        os.path.join(
-                            output_dir,
-                            f'probe_{probe_index:02d}_face_{face_index}_validity.png',
-                        ),
-                    )
-                validity_means.append(float(validity.mean().item()))
-    finally:
-        pipe.init_stage = old_init_stage
-    pc.local_light_probe.activate()
-    return {
-        'probe_count': count,
-        'mean_validity': sum(validity_means) / max(1, len(validity_means)),
-    }
