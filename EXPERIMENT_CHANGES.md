@@ -47,3 +47,10 @@
 - 2D glossy prior 加入 roughness 硬门控，先验 roughness 大于等于阈值时分数固定为零，不参与多视角高斯累积。
 - 新增二次射线辐射、混合 gate、命中 opacity 和 roughness gate 诊断图。
 - `tandt-eval.sh` 实验名改为 `raytrace`，并在训练前预编译 3DGRT，尽早暴露 CUDA/OptiX 环境问题。
+
+## 2026-08-21：AutoDL 强制同步 3DGRT 子模块
+
+- `rungit.sh` 默认同步 `origin/rtsplat-test`，避免误回退到不含 3DGRT 的 baseline 分支。
+- 主仓库更新后强制同步并检出固定版本的官方 `3dgrut` 子模块。
+- 单独初始化 3DGRT 编译必需的 OptiX headers，不额外下载当前未使用的依赖。
+- 支持通过 `bash rungit.sh <分支名>` 临时选择其他远端分支。
