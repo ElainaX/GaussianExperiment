@@ -26,6 +26,7 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
     compute_gaussian_glossy_score,
     compute_gaussian_score_rtsplat,
     edge_aware_loss,
+    glossy_normal_rate_supervision,
     normal_prior_supervision,
 )
 from utils.general_utils import GaussianTracker, safe_state
@@ -53,7 +54,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (
             name.startswith('glossy_') or
             name.startswith('normal_prior_') or
-            name == 'lambda_normal_prior'
+            name in ('lambda_normal_prior', 'lambda_glossy_normal_rate')
         ):
             setattr(dataset, name, value)
     tb_writer, tb_executor = prepare_output_and_logger(dataset)
@@ -96,6 +97,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     roughness_threshold = float(opt.glossy_prior_roughness_threshold)
     if not 0.0 <= roughness_threshold <= 1.0:
         raise ValueError('glossy_prior_roughness_threshold must be in [0, 1]')
+    if opt.lambda_glossy_normal_rate > 0:
+        if not opt.glossy_prior_on:
+            raise ValueError(
+                '--lambda_glossy_normal_rate requires --glossy_prior_on'
+            )
+        if opt.glossy_normal_rate_from_iter < opt.densify_until_iter:
+            raise ValueError(
+                'glossy_normal_rate_from_iter must be >= densify_until_iter'
+            )
+        if opt.glossy_normal_rate_radius < 1:
+            raise ValueError('glossy_normal_rate_radius must be at least 1')
+        if opt.glossy_normal_rate_depth_sigma <= 0:
+            raise ValueError('glossy_normal_rate_depth_sigma must be positive')
+        if opt.glossy_normal_rate_margin < 0:
+            raise ValueError('glossy_normal_rate_margin cannot be negative')
+        if not 0.0 <= opt.glossy_normal_rate_threshold <= 1.0:
+            raise ValueError('glossy_normal_rate_threshold must be in [0, 1]')
+        if not 0.0 <= opt.glossy_normal_rate_roughness_threshold <= 1.0:
+            raise ValueError(
+                'glossy_normal_rate_roughness_threshold must be in [0, 1]'
+            )
     if dataset.secondary_raytrace_on:
         if not opt.glossy_prior_on:
             raise ValueError('--secondary_raytrace_on requires --glossy_prior_on')
@@ -264,6 +286,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 loss += prior_norm_loss
                 loss_dict['normal_prior'] = prior_norm_loss.item()
+
+        # Relative normal-rate supervision for reflective surfaces. This does
+        # not align normals pixel by pixel; it only prevents neighboring glossy
+        # normals from bending more than the depth-consistent 2D prior.
+        if (
+            opt.lambda_glossy_normal_rate > 0 and
+            iteration >= opt.glossy_normal_rate_from_iter and
+            viewpoint_cam.has_image_priors
+        ):
+            glossy_normal_rate_pkg = glossy_normal_rate_supervision(
+                viewpoint_cam,
+                surface_normal,
+                foreground,
+                render_pkg['surface_alpha'],
+                render_pkg['glossy_score'],
+                glossy_threshold=opt.glossy_normal_rate_threshold,
+                roughness_threshold=(
+                    opt.glossy_normal_rate_roughness_threshold
+                ),
+                depth_sigma=opt.glossy_normal_rate_depth_sigma,
+                margin=opt.glossy_normal_rate_margin,
+                min_alpha=opt.glossy_normal_rate_min_alpha,
+                radius=opt.glossy_normal_rate_radius,
+            )
+            if glossy_normal_rate_pkg is not None:
+                warmup = max(1, int(opt.glossy_normal_rate_warmup_iters))
+                warmup_scale = min(
+                    1.0,
+                    (iteration - opt.glossy_normal_rate_from_iter + 1) / warmup,
+                )
+                glossy_normal_rate_loss = (
+                    float(opt.lambda_glossy_normal_rate) * warmup_scale *
+                    glossy_normal_rate_pkg['loss']
+                )
+                loss += glossy_normal_rate_loss
+                loss_dict['glossy_normal_rate'] = (
+                    glossy_normal_rate_loss.item()
+                )
 
         # === 体积分散 loss：惩罚同一射线上的高斯过于分散，鼓励高斯贴合表面 ===
         if iteration >= opt.dist_loss_from_iter and opt.dist_loss_weight > 0:

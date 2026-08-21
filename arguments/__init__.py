@@ -144,6 +144,18 @@ class OptimizationParams(ParamGroup):
         self.normal_prior_edge_suppression = 2.0
         self.normal_prior_min_alpha = 0.05
         self.normal_prior_pool_size = 3
+        # Relative normal-variation supervision restricted to rendered glossy
+        # surfaces. Unlike lambda_normal_prior, this has no absolute direction
+        # target and only suppresses bending beyond the generated prior.
+        self.lambda_glossy_normal_rate = 0.0
+        self.glossy_normal_rate_from_iter = 15000
+        self.glossy_normal_rate_warmup_iters = 5000
+        self.glossy_normal_rate_threshold = 0.15
+        self.glossy_normal_rate_roughness_threshold = 0.45
+        self.glossy_normal_rate_depth_sigma = 0.03
+        self.glossy_normal_rate_margin = 0.002
+        self.glossy_normal_rate_min_alpha = 0.05
+        self.glossy_normal_rate_radius = 1
         self.occupancy_decay_weight = 0.001
         self.mask_loss_weight = 0.01
         self.mask_loss_from_iter = -1

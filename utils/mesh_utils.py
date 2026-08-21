@@ -122,11 +122,13 @@ class GaussianExtractor(object):
                 if export_path is not None:
                     prior_debug = None
                     normal_prior_debug = None
+                    glossy_normal_rate_debug = None
                     if self.prior_options is not None and viewpoint_cam.has_image_priors:
                         # Import lazily to avoid coupling mesh extraction to the
                         # training-only glossy-prior path when no priors exist.
                         from utils.fast_utils import (
                             build_prior_glossy_map,
+                            glossy_normal_rate_supervision,
                             normal_prior_supervision,
                         )
                         prior_debug = build_prior_glossy_map(
@@ -160,6 +162,44 @@ class GaussianExtractor(object):
                                 'normal_prior_pool_size',
                                 3,
                             ),
+                        )
+                        glossy_normal_rate_debug = glossy_normal_rate_supervision(
+                            viewpoint_cam,
+                            render_pkg['surface_normal'],
+                            render_pkg['foreground'],
+                            render_pkg['surface_alpha'],
+                            render_pkg['glossy_score'],
+                            glossy_threshold=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_threshold',
+                                0.15,
+                            ),
+                            roughness_threshold=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_roughness_threshold',
+                                0.45,
+                            ),
+                            depth_sigma=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_depth_sigma',
+                                0.03,
+                            ),
+                            margin=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_margin',
+                                0.002,
+                            ),
+                            min_alpha=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_min_alpha',
+                                0.05,
+                            ),
+                            radius=getattr(
+                                self.prior_options,
+                                'glossy_normal_rate_radius',
+                                1,
+                            ),
+                            return_details=True,
                         )
                     gt = viewpoint_cam.original_image
                     mask = viewpoint_cam.gt_transparent_mask.squeeze(0).float()
@@ -256,6 +296,32 @@ class GaussianExtractor(object):
                             save_img_u8,
                             normal_prior_debug['confidence'][0].cpu().numpy(),
                             os.path.join(vis_path, f'normal_prior_confidence_{i:05d}.png'),
+                        )
+                    if glossy_normal_rate_debug is not None:
+                        for debug_key, filename_prefix, scale in (
+                            ('rendered_rate', 'glossy_normal_rate_rendered', 0.05),
+                            ('prior_rate', 'glossy_normal_rate_prior', 0.05),
+                            ('error', 'glossy_normal_rate_excess', 0.05),
+                        ):
+                            executor.submit(
+                                save_img_u8,
+                                apply_colormap(
+                                    (glossy_normal_rate_debug[debug_key] / scale)
+                                    .clamp(0.0, 1.0)
+                                ).permute(1, 2, 0).cpu().numpy(),
+                                os.path.join(
+                                    vis_path,
+                                    f'{filename_prefix}_{i:05d}.png',
+                                ),
+                            )
+                        executor.submit(
+                            save_img_u8,
+                            glossy_normal_rate_debug['pair_support'][0]
+                            .cpu().numpy(),
+                            os.path.join(
+                                vis_path,
+                                f'glossy_normal_rate_mask_{i:05d}.png',
+                            ),
                         )
                     executor.submit(save_img_u8, render_pkg['transmissivity'][0].cpu().numpy(), os.path.join(vis_path, 'transmissivity_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['attenuation'][0].cpu().numpy(), os.path.join(vis_path, 'attenuation_{0:05d}'.format(i) + '.png'))

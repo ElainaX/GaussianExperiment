@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 
-from utils.general_utils import PILtoTorch
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
 
@@ -65,10 +64,12 @@ class Camera(nn.Module):
         self.prior_depth_path = prior_depth_path
         self.prior_normal_path = prior_normal_path
         self.prior_roughness_path = prior_roughness_path
-        # Lazily cache the resized uint8 normal map on CPU. Normal-prior
-        # supervision accesses one view every iteration; caching avoids tens of
-        # thousands of repeated PNG decodes without occupying GPU memory.
+        # Lazily cache resized priors as uint8 on CPU. Prior supervision may
+        # access one view every iteration; caching avoids tens of thousands of
+        # repeated PNG decodes without occupying persistent GPU memory.
+        self._prior_depth_u8_cache = None
         self._prior_normal_u8_cache = None
+        self._prior_roughness_u8_cache = None
 
         self.gt_transparent_mask = gt_transparent_mask.to(self.data_device)
 
@@ -106,20 +107,32 @@ class Camera(nn.Module):
         Depth and roughness are returned in [0, 1] with shape [1, H, W].
         RGB-encoded normals are decoded to [-1, 1], normalized, and returned
         with shape [3, H, W]. Missing modalities are returned as ``None``.
-        Maps are intentionally loaded on demand rather than cached globally.
+        Maps are decoded on first use and retained as compact CPU uint8 tensors;
+        only the active view is converted and copied to the requested device.
         """
         target_device = self.data_device if device is None else torch.device(device)
         resolution = (self.image_width, self.image_height)
 
-        def load_map(path, mode):
+        def load_scalar_map(path, cache_name):
             if path is None:
                 return None
-            with Image.open(path) as image:
-                tensor = PILtoTorch(image.convert(mode), resolution)
-            return tensor.to(target_device)
+            cached = getattr(self, cache_name)
+            if cached is None:
+                with Image.open(path) as image:
+                    resized = image.convert('L').resize(resolution)
+                    array = np.array(resized, dtype=np.uint8, copy=True)
+                cached = torch.from_numpy(array)[None].contiguous()
+                setattr(self, cache_name, cached)
+            return cached.to(
+                device=target_device, dtype=torch.float32, non_blocking=True
+            ) / 255.0
 
-        depth = load_map(self.prior_depth_path, 'L')
-        roughness = load_map(self.prior_roughness_path, 'L')
+        depth = load_scalar_map(
+            self.prior_depth_path, '_prior_depth_u8_cache'
+        )
+        roughness = load_scalar_map(
+            self.prior_roughness_path, '_prior_roughness_u8_cache'
+        )
         normal = self.load_normal_prior(device=target_device)
 
         return {

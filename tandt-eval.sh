@@ -1,7 +1,7 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="raytrace"
+EXPERIMENT_NAME="normrate"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
@@ -21,7 +21,8 @@ git -C "$SCRIPT_DIR" submodule update --init submodules/3dgrut
 git -C "$SCRIPT_DIR/submodules/3dgrut" submodule update --init threedgrt_tracer/dependencies/optix-dev
 python -m secondary_raytracer.build_3dgrt
 
-# SOTA setting: generated normal priors are debug-only, not a training loss.
+# Keep absolute normal-prior alignment off. The enabled relative-rate loss only
+# constrains local bending inside glossy regions.
 TRAIN_CMD="python train.py \
     -s ~/autodl-tmp/truck \
     -m $MODEL_DIR \
@@ -50,6 +51,14 @@ TRAIN_CMD="python train.py \
     --normal_prior_axis_sign -1.0 1.0 1.0 \
     --normal_prior_edge_suppression 2.0 \
     --normal_prior_pool_size 3 \
+    --lambda_glossy_normal_rate 0.02 \
+    --glossy_normal_rate_from_iter 15000 \
+    --glossy_normal_rate_warmup_iters 5000 \
+    --glossy_normal_rate_threshold 0.15 \
+    --glossy_normal_rate_roughness_threshold 0.45 \
+    --glossy_normal_rate_depth_sigma 0.03 \
+    --glossy_normal_rate_margin 0.002 \
+    --glossy_normal_rate_radius 1 \
     --glossy_prior_on \
     --glossy_from_iter 5000 \
     --glossy_interval 500 \

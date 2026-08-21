@@ -386,6 +386,152 @@ def normal_prior_supervision(
     }
 
 
+def glossy_normal_rate_supervision(
+    camera,
+    rendered_world_normal,
+    foreground,
+    surface_alpha,
+    rendered_glossy_score,
+    glossy_threshold=0.15,
+    roughness_threshold=0.45,
+    depth_sigma=0.03,
+    margin=0.002,
+    min_alpha=0.05,
+    radius=1,
+    return_details=False,
+):
+    """Keep glossy surfaces no more curved than their 2D normal prior.
+
+    The loss compares *relative* angular changes between neighboring normals:
+    ``1 - dot(n[p], n[q])``.  It therefore does not require the generated
+    camera-space prior to have the same global axis convention as the rendered
+    world-space normals.  The asymmetric penalty allows the reconstruction to
+    be flatter than a noisy prior and only suppresses excess rendered bending.
+
+    Pixel pairs are admitted only when both endpoints are rendered glossy,
+    low-roughness, visible surface pixels.  Prior-depth discontinuities block
+    pairs so foreground/background or adjacent objects are not flattened
+    together.
+    """
+    if not camera.has_image_priors:
+        return None
+    priors = camera.load_image_priors(device=rendered_world_normal.device)
+    if any(priors[name] is None for name in ('depth', 'normal', 'roughness')):
+        return None
+
+    radius = max(1, int(radius))
+    depth_sigma = max(float(depth_sigma), 1e-6)
+    margin = max(float(margin), 0.0)
+    glossy_threshold = min(max(float(glossy_threshold), 0.0), 1.0)
+    roughness_threshold = min(max(float(roughness_threshold), 0.0), 1.0)
+
+    rendered_normal_norm = rendered_world_normal.detach().norm(
+        dim=0, keepdim=True
+    )
+    prior_normal_norm = priors['normal'].detach().norm(dim=0, keepdim=True)
+    rendered_normal = F.normalize(rendered_world_normal, dim=0, eps=1e-6)
+    prior_normal = F.normalize(priors['normal'], dim=0, eps=1e-6)
+    prior_depth = priors['depth'][0].detach()
+    prior_roughness = priors['roughness'][0].detach()
+    glossy_score = rendered_glossy_score[0].detach().clamp(0.0, 1.0)
+
+    alpha = surface_alpha[0].detach().clamp(0.0, 1.0)
+    base_confidence = (
+        foreground[0].detach().clamp(0.0, 1.0) *
+        alpha *
+        (alpha >= float(min_alpha)).to(alpha.dtype) *
+        (rendered_normal_norm[0] > 0.2).to(alpha.dtype) *
+        (prior_normal_norm[0] > 0.5).to(alpha.dtype) *
+        (glossy_score >= glossy_threshold).to(alpha.dtype) *
+        (prior_roughness < roughness_threshold).to(alpha.dtype)
+    )
+
+    height, width = glossy_score.shape
+    weighted_error_sum = rendered_normal.new_zeros(())
+    pair_weight_sum = rendered_normal.new_zeros(())
+
+    if return_details:
+        # Diagnostic maps are detached so accumulating them does not enlarge
+        # the autograd graph. Each pair contributes to both endpoints.
+        error_sum_map = torch.zeros_like(glossy_score)
+        rendered_rate_sum_map = torch.zeros_like(glossy_score)
+        prior_rate_sum_map = torch.zeros_like(glossy_score)
+        weight_sum_map = torch.zeros_like(glossy_score)
+
+    for offset_y in range(0, radius + 1):
+        for offset_x in range(-radius, radius + 1):
+            if offset_y == 0 and offset_x <= 0:
+                continue
+
+            y_a = slice(0, height - offset_y)
+            y_b = slice(offset_y, height)
+            if offset_x >= 0:
+                x_a = slice(0, width - offset_x)
+                x_b = slice(offset_x, width)
+            else:
+                x_a = slice(-offset_x, width)
+                x_b = slice(0, width + offset_x)
+
+            rendered_a = rendered_normal[:, y_a, x_a]
+            rendered_b = rendered_normal[:, y_b, x_b]
+            prior_a = prior_normal[:, y_a, x_a]
+            prior_b = prior_normal[:, y_b, x_b]
+
+            distance_sq = float(offset_x * offset_x + offset_y * offset_y)
+            rendered_rate = (1.0 - (
+                rendered_a * rendered_b
+            ).sum(dim=0).clamp(-1.0, 1.0)) / distance_sq
+            prior_rate = (1.0 - (
+                prior_a * prior_b
+            ).sum(dim=0).clamp(-1.0, 1.0)) / distance_sq
+            excess_rate = F.relu(rendered_rate - prior_rate - margin)
+
+            confidence_a = base_confidence[y_a, x_a]
+            confidence_b = base_confidence[y_b, x_b]
+            pair_confidence = torch.minimum(confidence_a, confidence_b)
+            depth_delta = (
+                prior_depth[y_a, x_a] - prior_depth[y_b, x_b]
+            ).abs()
+            depth_continuity = (
+                torch.exp(-depth_delta / depth_sigma) *
+                (depth_delta <= 3.0 * depth_sigma).to(depth_delta.dtype)
+            )
+            pair_weight = pair_confidence * depth_continuity
+
+            weighted_error_sum = weighted_error_sum + (
+                excess_rate * pair_weight
+            ).sum()
+            pair_weight_sum = pair_weight_sum + pair_weight.sum()
+
+            if return_details:
+                detached_weight = pair_weight.detach()
+                detached_error = excess_rate.detach() * detached_weight
+                detached_rendered_rate = rendered_rate.detach() * detached_weight
+                detached_prior_rate = prior_rate.detach() * detached_weight
+                error_sum_map[y_a, x_a] += detached_error
+                error_sum_map[y_b, x_b] += detached_error
+                rendered_rate_sum_map[y_a, x_a] += detached_rendered_rate
+                rendered_rate_sum_map[y_b, x_b] += detached_rendered_rate
+                prior_rate_sum_map[y_a, x_a] += detached_prior_rate
+                prior_rate_sum_map[y_b, x_b] += detached_prior_rate
+                weight_sum_map[y_a, x_a] += detached_weight
+                weight_sum_map[y_b, x_b] += detached_weight
+
+    loss = weighted_error_sum / pair_weight_sum.clamp_min(1e-8)
+    if not return_details:
+        return {'loss': loss}
+
+    normalizer = weight_sum_map.clamp_min(1e-8)
+    return {
+        'loss': loss,
+        'error': (error_sum_map / normalizer)[None],
+        'rendered_rate': (rendered_rate_sum_map / normalizer)[None],
+        'prior_rate': (prior_rate_sum_map / normalizer)[None],
+        'confidence': base_confidence[None],
+        'pair_support': (weight_sum_map > 0).to(weight_sum_map.dtype)[None],
+    }
+
+
 @torch.no_grad()
 def build_prior_glossy_map(camera, opt, device='cuda', return_details=False):
     """Build a per-view 2D glossy probability from RGB/material priors.
