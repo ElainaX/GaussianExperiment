@@ -66,3 +66,14 @@
 - loss 从增殖结束的第 15000 次迭代开始，经 5000 次迭代预热，默认实验权重为 0.02。
 - 新增渲染/先验法线变化率、超额弯曲误差和实际约束 mask 的 `vis` 输出。
 - `tandt-eval.sh` 实验名改为 `normrate`。
+
+## 2026-08-22：3DGRT 多视角高斯可靠性诊断
+
+- 增殖结束后，用训练相机下 alpha/transmittance 加权的有效像素覆盖计算每个高斯的多视角可靠性 `R`。
+- `R` 同时考虑有效可见视角数和每个有效视角的平均像素覆盖；默认分别在 8 个视角和 16 个像素处饱和。
+- 在 15000～30000 次迭代之间每 5000 次迭代采样 32 个训练相机，并以 0.5 EMA 更新可靠性。
+- 将 `raytrace_reliability` 保存到 PLY；旧 PLY 缺少该字段时安全回退为零。
+- 额外用方向无关 SH 对二次射线命中的高斯可靠性做 alpha 加权积分，输出 `secondary_raytrace_reliability`。
+- 可靠性追踪只在 `render.py` 显式开启 debug 时执行，避免训练阶段把 3DGRT 工作量翻倍。
+- 本阶段只做诊断，不使用 `R` 过滤 BVH、修改 hit opacity 或改变 SphMip/3DGRT 混合结果。
+- `tandt-eval.sh` 实验名改为 `reliability`。

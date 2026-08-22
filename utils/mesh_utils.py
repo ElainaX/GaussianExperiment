@@ -216,6 +216,7 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, secondary_radiance_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_radiance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_gate'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_gate_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_hit_opacity'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_hit_opacity_{0:05d}'.format(i) + '.png'))
+                    executor.submit(save_img_u8, render_pkg['secondary_raytrace_reliability'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_reliability_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_tran'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'transmitted_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))

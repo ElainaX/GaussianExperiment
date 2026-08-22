@@ -205,6 +205,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     secondary_radiance = torch.zeros(3, image_height, image_width).cuda()
     secondary_gate = torch.zeros(1, image_height, image_width).cuda()
     secondary_hit_opacity = torch.zeros(1, image_height, image_width).cuda()
+    secondary_reliability = torch.zeros(1, image_height, image_width).cuda()
 
     viewdirs = F.normalize(viewdirs, dim=-1)
     normal_map = surface_normal.movedim(0, -1)
@@ -277,8 +278,17 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                     position_map[ray_local_index] +
                     pc.secondary_raytrace_origin_epsilon * trace_directions
                 )
-                ray_radiance, ray_opacity = pc.get_secondary_raytracer().trace(
-                    pc, trace_origins, trace_directions
+                ray_radiance, ray_opacity, ray_reliability = (
+                    pc.get_secondary_raytracer().trace(
+                        pc,
+                        trace_origins,
+                        trace_directions,
+                        return_reliability=getattr(
+                            pipe,
+                            'secondary_raytrace_reliability_debug',
+                            False,
+                        ),
+                    )
                 )
                 material_weight = (
                     pc.secondary_raytrace_strength *
@@ -306,6 +316,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                 secondary_hit_opacity.reshape(1, -1)[:, pixel_index] = (
                     ray_opacity.transpose(0, 1)
                 )
+                if ray_reliability is not None:
+                    secondary_reliability.reshape(1, -1)[:, pixel_index] = (
+                        ray_reliability.transpose(0, 1)
+                    )
 
         render_spec.reshape(3, -1)[:, select_index] = spec_light.transpose(0, 1)
         render_attenuation.reshape(1, -1)[:, select_index] = spec_attenuation.transpose(0, 1)
@@ -340,6 +354,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         'secondary_raytrace_radiance': secondary_radiance,
         'secondary_raytrace_gate': secondary_gate,
         'secondary_raytrace_hit_opacity': secondary_hit_opacity,
+        'secondary_raytrace_reliability': secondary_reliability,
         'surface_position': render_position,
         'transmissivity': render_transmissivity,
         'attenuation': render_attenuation,

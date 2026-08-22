@@ -749,6 +749,71 @@ def compute_gaussian_glossy_score(viewpoint_stack, gaussians, pipe, bg, opt):
     }
 
 
+@torch.no_grad()
+def compute_gaussian_multiview_reliability(
+    viewpoint_stack, gaussians, bg, opt
+):
+    """Estimate per-Gaussian geometric support from training-camera coverage.
+
+    For every sampled camera, rasterize an all-ones image back to Gaussians.
+    The result is the alpha/transmittance-weighted pixel mass actually
+    contributed by each Gaussian, rather than its unoccluded bounding radius.
+    Reliability is the product of a multi-view support score and a mean
+    per-supported-view footprint score, both saturated at configurable values.
+    """
+    if not viewpoint_stack:
+        return None
+
+    cameras = _sample_cameras(
+        viewpoint_stack, int(opt.raytrace_reliability_num_cams)
+    )
+    count = gaussians.get_xyz.shape[0]
+    device = gaussians.get_xyz.device
+    view_count = torch.zeros(count, device=device)
+    pixel_mass_sum = torch.zeros(count, device=device)
+    min_pixel_mass = max(
+        float(opt.raytrace_reliability_min_pixel_mass), 1e-6
+    )
+
+    for camera in cameras:
+        ones = torch.ones(
+            camera.image_height,
+            camera.image_width,
+            device=gaussians.get_xyz.device,
+            dtype=torch.float32,
+        )
+        pixel_mass, _ = accumulate_gaussian_map(
+            camera, gaussians, bg, ones
+        )
+        pixel_mass = torch.nan_to_num(
+            pixel_mass.reshape(-1).float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        supported = pixel_mass >= min_pixel_mass
+        view_count += supported.to(view_count.dtype)
+        pixel_mass_sum += pixel_mass * supported.to(pixel_mass.dtype)
+
+    mean_pixel_mass = pixel_mass_sum / view_count.clamp_min(1.0)
+    view_score = (
+        view_count /
+        max(float(opt.raytrace_reliability_full_view_count), 1.0)
+    ).clamp(0.0, 1.0)
+    footprint_score = (
+        mean_pixel_mass /
+        max(float(opt.raytrace_reliability_full_pixel_mass), min_pixel_mass)
+    ).clamp(0.0, 1.0)
+    reliability = (view_score * footprint_score).clamp(0.0, 1.0)
+
+    return {
+        'reliability': reliability,
+        'view_count': view_count,
+        'mean_pixel_mass': mean_pixel_mass,
+        'used_cameras': len(cameras),
+    }
+
+
 def compute_gaussian_score_rtsplat(viewpoint_stack, gaussians, pipe, bg, opt, skip_importance=False):
     """计算每个高斯的多视角重建质量分数，用于指导 densification 和 pruning。
 

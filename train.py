@@ -24,6 +24,7 @@ from gaussian_renderer import *
 from scene import GaussianModel, Scene
 from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
     compute_gaussian_glossy_score,
+    compute_gaussian_multiview_reliability,
     compute_gaussian_score_rtsplat,
     edge_aware_loss,
     glossy_normal_rate_supervision,
@@ -97,6 +98,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     roughness_threshold = float(opt.glossy_prior_roughness_threshold)
     if not 0.0 <= roughness_threshold <= 1.0:
         raise ValueError('glossy_prior_roughness_threshold must be in [0, 1]')
+    if opt.raytrace_reliability_on:
+        if not dataset.secondary_raytrace_on:
+            raise ValueError(
+                '--raytrace_reliability_on requires --secondary_raytrace_on'
+            )
+        if opt.raytrace_reliability_from_iter < opt.densify_until_iter:
+            raise ValueError(
+                'raytrace_reliability_from_iter must be >= densify_until_iter'
+            )
+        if (
+            opt.raytrace_reliability_until_iter <
+            opt.raytrace_reliability_from_iter
+        ):
+            raise ValueError(
+                'raytrace_reliability_until_iter must be >= from_iter'
+            )
+        if (
+            opt.raytrace_reliability_until_iter >
+            dataset.secondary_raytrace_from_iter
+        ):
+            raise ValueError(
+                'raytrace_reliability_until_iter must be <= '
+                'secondary_raytrace_from_iter'
+            )
+        if opt.raytrace_reliability_interval <= 0:
+            raise ValueError('raytrace_reliability_interval must be positive')
+        if opt.raytrace_reliability_num_cams <= 0:
+            raise ValueError('raytrace_reliability_num_cams must be positive')
+        if opt.raytrace_reliability_min_pixel_mass <= 0:
+            raise ValueError(
+                'raytrace_reliability_min_pixel_mass must be positive'
+            )
+        if opt.raytrace_reliability_full_view_count <= 0:
+            raise ValueError(
+                'raytrace_reliability_full_view_count must be positive'
+            )
+        if (
+            opt.raytrace_reliability_full_view_count >
+            opt.raytrace_reliability_num_cams
+        ):
+            raise ValueError(
+                'raytrace_reliability_full_view_count cannot exceed num_cams'
+            )
+        if opt.raytrace_reliability_full_pixel_mass <= 0:
+            raise ValueError(
+                'raytrace_reliability_full_pixel_mass must be positive'
+            )
+        if (
+            opt.raytrace_reliability_full_pixel_mass <
+            opt.raytrace_reliability_min_pixel_mass
+        ):
+            raise ValueError(
+                'raytrace_reliability_full_pixel_mass must be >= '
+                'min_pixel_mass'
+            )
+        if not 0.0 <= opt.raytrace_reliability_ema < 1.0:
+            raise ValueError('raytrace_reliability_ema must be in [0, 1)')
     if opt.lambda_glossy_normal_rate > 0:
         if not opt.glossy_prior_on:
             raise ValueError(
@@ -483,6 +541,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         tb_writer.add_scalar('glossy_prior/mean_view_angle_spread', mean_angle, iteration)
                         tb_writer.add_scalar('glossy_prior/mean_angle_compensation', mean_angle_comp, iteration)
                         tb_writer.add_scalar('glossy_prior/high_score_gaussians', glossy_count, iteration)
+
+            # Before secondary tracing starts, estimate whether each Gaussian
+            # has stable multi-view geometric support. This is diagnostic-only:
+            # it is saved with the model but does not filter or reweight BVH.
+            if (
+                opt.raytrace_reliability_on and
+                opt.raytrace_reliability_from_iter <= iteration <=
+                opt.raytrace_reliability_until_iter and
+                (
+                    iteration - opt.raytrace_reliability_from_iter
+                ) % opt.raytrace_reliability_interval == 0
+            ):
+                reliability_stats = compute_gaussian_multiview_reliability(
+                    scene.getTrainCameras(), gaussians, bg, opt
+                )
+                if reliability_stats is not None:
+                    gaussians.update_raytrace_reliability(
+                        reliability_stats['reliability'],
+                        ema=opt.raytrace_reliability_ema,
+                    )
+                    reliability = gaussians.get_raytrace_reliability[:, 0]
+                    supported = reliability_stats['view_count'] > 0
+                    mean_reliability = (
+                        reliability[supported].mean().item()
+                        if supported.any() else 0.0
+                    )
+                    reliable_count = int((reliability >= 0.5).sum().item())
+                    print(
+                        f"[RAYTRACE-RELIABILITY] "
+                        f"cameras={reliability_stats['used_cameras']} "
+                        f"mean={mean_reliability:.4f} "
+                        f"reliable={reliable_count}/{reliability.numel()}"
+                    )
+                    if tb_writer:
+                        tb_writer.add_scalar(
+                            'raytrace_reliability/mean',
+                            mean_reliability,
+                            iteration,
+                        )
+                        tb_writer.add_scalar(
+                            'raytrace_reliability/count_ge_0.5',
+                            reliable_count,
+                            iteration,
+                        )
 
             if iteration in checkpoint_iterations:
                 print('\n[ITER {}] Saving Checkpoint'.format(iteration))

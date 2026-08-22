@@ -102,6 +102,9 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.init_stage = False
         self.disable_secondary_raytrace = False
+        # Export-only extra 3DGRT pass that integrates per-Gaussian reliability.
+        # Keep false during training to avoid doubling secondary-ray work.
+        self.secondary_raytrace_reliability_debug = False
         super().__init__(parser, 'Pipeline Parameters')
 
 
@@ -156,6 +159,17 @@ class OptimizationParams(ParamGroup):
         self.glossy_normal_rate_margin = 0.002
         self.glossy_normal_rate_min_alpha = 0.05
         self.glossy_normal_rate_radius = 1
+        # Multi-view alpha-footprint reliability for 3DGRT diagnostics. The
+        # score is computed after densification and does not alter tracing yet.
+        self.raytrace_reliability_on = False
+        self.raytrace_reliability_from_iter = 15000
+        self.raytrace_reliability_until_iter = 30000
+        self.raytrace_reliability_interval = 5000
+        self.raytrace_reliability_num_cams = 32
+        self.raytrace_reliability_min_pixel_mass = 1.0
+        self.raytrace_reliability_full_view_count = 8.0
+        self.raytrace_reliability_full_pixel_mass = 16.0
+        self.raytrace_reliability_ema = 0.5
         self.occupancy_decay_weight = 0.001
         self.mask_loss_weight = 0.01
         self.mask_loss_from_iter = -1

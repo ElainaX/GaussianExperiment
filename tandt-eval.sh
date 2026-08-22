@@ -1,7 +1,7 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="normrate"
+EXPERIMENT_NAME="reliability"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
@@ -59,6 +59,15 @@ TRAIN_CMD="python train.py \
     --glossy_normal_rate_depth_sigma 0.03 \
     --glossy_normal_rate_margin 0.002 \
     --glossy_normal_rate_radius 1 \
+    --raytrace_reliability_on \
+    --raytrace_reliability_from_iter 15000 \
+    --raytrace_reliability_until_iter 30000 \
+    --raytrace_reliability_interval 5000 \
+    --raytrace_reliability_num_cams 32 \
+    --raytrace_reliability_min_pixel_mass 1.0 \
+    --raytrace_reliability_full_view_count 8.0 \
+    --raytrace_reliability_full_pixel_mass 16.0 \
+    --raytrace_reliability_ema 0.5 \
     --glossy_prior_on \
     --glossy_from_iter 5000 \
     --glossy_interval 500 \
@@ -99,6 +108,7 @@ echo "$TRAIN_CMD" > "$MODEL_DIR/train_cmd.txt"
 
 eval "$TRAIN_CMD"
 
-python render.py -m "$MODEL_DIR" --skip_train --skip_mesh
+python render.py -m "$MODEL_DIR" --skip_train --skip_mesh \
+    --secondary_raytrace_reliability_debug
 
 python metrics.py -m "$MODEL_DIR"

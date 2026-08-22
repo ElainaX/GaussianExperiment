@@ -254,7 +254,10 @@ class ThreeDGRTSecondaryTracer:
             self._last_gaussian_count = count
         self._build_count += 1
 
-    def trace(self, gaussians, ray_origins, ray_directions):
+    def trace(
+        self, gaussians, ray_origins, ray_directions,
+        return_reliability=False,
+    ):
         if ray_origins.ndim != 2 or ray_origins.shape[-1] != 3:
             raise ValueError('3DGRT ray origins must have shape [N, 3]')
         if ray_directions.shape != ray_origins.shape:
@@ -294,5 +297,45 @@ class ThreeDGRTSecondaryTracer:
             min(int(gaussians.active_sh_degree), 3),
             self.min_transmittance,
         )
-        self._frame_id += 1
-        return radiance.reshape(-1, 3), opacity.reshape(-1, 1).clamp(0.0, 1.0)
+        reliability = None
+        frame_advance = 1
+        if return_reliability:
+            # Encode scalar R_g as direction-independent RGB SH. The official
+            # kernel evaluates C0 * coeff_dc + 0.5, so this produces exactly
+            # R_g at every accepted Gaussian without changing CUDA code.
+            sh_c0 = 0.28209479177387814
+            reliability_features = torch.zeros_like(features)
+            reliability_dc = (
+                gaussians.get_raytrace_reliability.clamp(0.0, 1.0) - 0.5
+            ) / sh_c0
+            reliability_features[:, :3] = reliability_dc.expand(-1, 3)
+            reliability_radiance, _ = _TraceRays.apply(
+                self.wrapper,
+                self._frame_id + 1,
+                ray_to_world,
+                rays_o,
+                rays_d,
+                gaussians.get_xyz,
+                gaussians.get_rotation,
+                scales,
+                gaussians.get_occupancy,
+                reliability_features,
+                0,
+                self.min_transmittance,
+            )
+            flat_opacity = opacity.reshape(-1, 1).clamp(0.0, 1.0)
+            reliability_numerator = reliability_radiance.reshape(
+                -1, 3
+            ).mean(dim=1, keepdim=True)
+            reliability = torch.where(
+                flat_opacity > 1e-6,
+                reliability_numerator / flat_opacity.clamp_min(1e-6),
+                torch.zeros_like(flat_opacity),
+            ).clamp(0.0, 1.0)
+            frame_advance = 2
+        self._frame_id += frame_advance
+        return (
+            radiance.reshape(-1, 3),
+            opacity.reshape(-1, 1).clamp(0.0, 1.0),
+            reliability,
+        )

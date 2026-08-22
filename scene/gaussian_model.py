@@ -122,6 +122,10 @@ class GaussianModel:
         self._prior_glossy_score = torch.empty(0)
         self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 1.0))
         self.glossy_update_count = 0
+        # Alpha-footprint support across training cameras. This fixed score is
+        # diagnostic-only until an explicit 3DGRT routing policy is enabled.
+        self._raytrace_reliability = torch.empty(0)
+        self.raytrace_reliability_update_count = 0
 
         def optional_arg(name, default):
             value = getattr(args, name, default)
@@ -209,9 +213,12 @@ class GaussianModel:
             self.last_update,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._raytrace_reliability,
         )
 
     def restore(self, model_args, training_args):
+        if len(model_args) == 14:
+            model_args = (*model_args, None)
         (
             self.active_sh_degree,
             self._xyz,
@@ -227,7 +234,16 @@ class GaussianModel:
             last_update,
             opt_dict,
             self.spatial_lr_scale,
+            raytrace_reliability,
         ) = model_args
+        if raytrace_reliability is None:
+            self._raytrace_reliability = torch.zeros(
+                self._xyz.shape[0], device=self._xyz.device
+            )
+            self.raytrace_reliability_update_count = 0
+        else:
+            self._raytrace_reliability = raytrace_reliability
+            self.raytrace_reliability_update_count = 1
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -249,6 +265,10 @@ class GaussianModel:
     @property
     def get_prior_glossy_score(self):
         return self._prior_glossy_score.unsqueeze(-1)
+
+    @property
+    def get_raytrace_reliability(self):
+        return self._raytrace_reliability.unsqueeze(-1)
 
     @property
     def get_language_feature(self):
@@ -321,6 +341,8 @@ class GaussianModel:
         N = fused_point_cloud.shape[0]
         self._prior_glossy_score = torch.zeros(N, device='cuda')
         self.glossy_update_count = 0
+        self._raytrace_reliability = torch.zeros(N, device='cuda')
+        self.raytrace_reliability_update_count = 0
 
         self._roughness = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
         self._reflectance = nn.Parameter((torch.zeros((fused_point_cloud.shape[0], 1), device='cuda')).requires_grad_(True))
@@ -406,6 +428,7 @@ class GaussianModel:
             l.append('feature_{}'.format(i))
 
         l.append('prior_glossy_score')
+        l.append('raytrace_reliability')
 
         return l
 
@@ -429,11 +452,12 @@ class GaussianModel:
         language_feature = self._language_feature.detach().cpu().numpy()
 
         prior_glossy_score = self._prior_glossy_score.cpu().numpy().reshape(-1, 1).astype(np.float32)
+        raytrace_reliability = self._raytrace_reliability.cpu().numpy().reshape(-1, 1).astype(np.float32)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature, prior_glossy_score), axis=1)
+        attributes = np.concatenate((xyz, f_dc, f_rest, occupancies, opacity, transmissivity, scale, rotation, roughness, reflectance, language_feature, prior_glossy_score, raytrace_reliability), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -540,6 +564,19 @@ class GaussianModel:
             self._prior_glossy_score = torch.zeros(N, device='cuda')
             self.glossy_update_count = 0
 
+        # [3DGRT RELIABILITY] graceful fallback for older PLY files.
+        try:
+            reliability = np.asarray(
+                plydata.elements[0]['raytrace_reliability']
+            ).astype(np.float32)
+            self._raytrace_reliability = torch.tensor(
+                reliability, dtype=torch.float, device='cuda'
+            )
+            self.raytrace_reliability_update_count = 1
+        except Exception:
+            self._raytrace_reliability = torch.zeros(N, device='cuda')
+            self.raytrace_reliability_update_count = 0
+
         self.light_mlp = torch.load(path.split('point_cloud.ply')[0] + '/light_mlp.pt')
         self.dir_encoding = torch.load(path.split('point_cloud.ply')[0] + '/dir_encoding.pt')
         print('Load Path', path)
@@ -610,6 +647,9 @@ class GaussianModel:
 
         # [GLOSSY PRIOR]
         self._prior_glossy_score = self._prior_glossy_score[valid_points_mask]
+        self._raytrace_reliability = self._raytrace_reliability[
+            valid_points_mask
+        ]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -671,6 +711,12 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')  # [FASTGS]
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device='cuda')
+        # Reliability is recomputed only after densification. Keep existing
+        # values aligned and mark new children unknown until that update.
+        self._raytrace_reliability = torch.cat([
+            self._raytrace_reliability,
+            torch.zeros(new_xyz.shape[0], device='cuda'),
+        ])
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -942,6 +988,26 @@ class GaussianModel:
                 self._reflectance.data[mask], reflectance_logit.expand_as(self._reflectance.data[mask])
             )
         return int(mask.sum().item())
+
+    @torch.no_grad()
+    def update_raytrace_reliability(self, score, ema=0.5):
+        """Persist an EMA of alpha-footprint multi-view support."""
+        score = torch.nan_to_num(
+            score.reshape(-1), nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+        if score.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError(
+                f'Raytrace reliability length {score.shape[0]} does not match '
+                f'{self.get_xyz.shape[0]} Gaussians'
+            )
+        if self.raytrace_reliability_update_count == 0:
+            self._raytrace_reliability.copy_(score)
+        else:
+            momentum = min(max(float(ema), 0.0), 0.9999)
+            self._raytrace_reliability.mul_(momentum).add_(
+                score, alpha=1.0 - momentum
+            )
+        self.raytrace_reliability_update_count += 1
 
     def get_secondary_raytracer(self):
         """Create the optional 3DGRT backend on first eligible render."""
