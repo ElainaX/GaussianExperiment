@@ -77,3 +77,11 @@
 - 可靠性追踪只在 `render.py` 显式开启 debug 时执行，避免训练阶段把 3DGRT 工作量翻倍。
 - 本阶段只做诊断，不使用 `R` 过滤 BVH、修改 hit opacity 或改变 SphMip/3DGRT 混合结果。
 - `tandt-eval.sh` 实验名改为 `reliability`。
+
+## 2026-08-22：修正 Window PSNR 的统计区域
+
+- 训练日志中的 Window PSNR 改为只在白色透明区域 mask 内计算 RGB MSE，mask 外像素不再以黑色背景参与分母。
+- 同步修正 Opaque PSNR，只统计非透明区域，且平均时跳过不存在对应区域的相机。
+- `metrics.py` 输出的 `Masked PSNR` 使用同一套有效像素统计，保留原 JSON 字段名以兼容已有分析脚本。
+- Masked SSIM 与 Masked LPIPS 的历史定义暂时保持不变；本次只修正用户指定的 PSNR。
+- `tandt-eval.sh` 实验名改为 `maskpsnr`。

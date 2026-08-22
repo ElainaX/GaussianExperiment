@@ -1,7 +1,7 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="reliability"
+EXPERIMENT_NAME="maskpsnr"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"

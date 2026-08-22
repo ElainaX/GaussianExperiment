@@ -23,6 +23,43 @@ def psnr(img1, img2):
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 
+def masked_psnr(img1, img2, mask):
+    """Compute PSNR from mask-selected RGB samples only.
+
+    Unlike multiplying both images by a mask before calling ``psnr``, this
+    excludes mask-background pixels from the MSE denominator. Images may be
+    ``[C, H, W]`` or ``[B, C, H, W]``; the mask must be broadcastable to the
+    corresponding batched image shape.
+    """
+    if img1.shape != img2.shape:
+        raise ValueError(f'Image shapes must match, got {img1.shape} and {img2.shape}')
+    if img1.dim() == 3:
+        img1 = img1.unsqueeze(0)
+        img2 = img2.unsqueeze(0)
+    elif img1.dim() != 4:
+        raise ValueError(f'Expected [C,H,W] or [B,C,H,W] images, got {img1.shape}')
+
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+    elif mask.dim() != 4:
+        raise ValueError(f'Expected a 2D, 3D, or 4D mask, got {mask.shape}')
+
+    try:
+        valid = torch.broadcast_to(mask.to(device=img1.device, dtype=torch.bool), img1.shape)
+    except RuntimeError as error:
+        raise ValueError(f'Mask shape {mask.shape} is not broadcastable to image shape {img1.shape}') from error
+
+    valid_count = valid.sum(dim=(1, 2, 3))
+    if (valid_count == 0).any():
+        raise ValueError('masked_psnr requires at least one selected pixel per image')
+
+    squared_error = (img1 - img2).pow(2)
+    masked_mse = (squared_error * valid).sum(dim=(1, 2, 3)) / valid_count
+    return 20 * torch.log10(1.0 / torch.sqrt(masked_mse)).unsqueeze(1)
+
+
 def apply_colormap(image, cmap='turbo'):
     colormap = matplotlib.colormaps[cmap]
     return torch.tensor(colormap(image.squeeze(0).cpu().numpy())[..., :3]).permute(2, 0, 1)

@@ -31,7 +31,7 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
     normal_prior_supervision,
 )
 from utils.general_utils import GaussianTracker, safe_state
-from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
+from utils.image_utils import apply_colormap, local_variance, log_normalize, masked_psnr, psnr
 from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
 
 try:
@@ -643,6 +643,8 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                 lpips_test = 0.0
                 window_psnr_test = 0.0
                 opaque_psnr_test = 0.0
+                window_psnr_views = 0
+                opaque_psnr_views = 0
                 for idx, viewpoint in enumerate(config['cameras']):
                     render_pkg = renderFunc(viewpoint, scene.gaussians)
                     image = torch.clamp(render_pkg['final_rendering'], 0.0, 1.0)
@@ -686,8 +688,10 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                     psnr_value = psnr(image, gt_image).mean().double()
                     ssim_value = ssim(image, gt_image).mean().double()
                     lpips_value = lpips(image, gt_image).mean().double()
-                    window_psnr_value = psnr(image * gt_transparent_mask, gt_image * gt_transparent_mask).mean().double() if gt_transparent_mask.any() else 0.0
-                    opaque_psnr_value = psnr(image * ~gt_transparent_mask, gt_image * ~gt_transparent_mask).mean().double() if (~gt_transparent_mask).any() else 0.0
+                    has_window = bool(gt_transparent_mask.any())
+                    has_opaque = bool((~gt_transparent_mask).any())
+                    window_psnr_value = masked_psnr(image, gt_image, gt_transparent_mask).mean().double() if has_window else 0.0
+                    opaque_psnr_value = masked_psnr(image, gt_image, ~gt_transparent_mask).mean().double() if has_opaque else 0.0
                     if tb_writer:
                         tb_writer.add_scalar(f'per_view_{config["name"]}/l1_loss - {viewpoint.image_name}', l1_value, iteration)
                         tb_writer.add_scalar(f'per_view_{config["name"]}/psnr - {viewpoint.image_name}', psnr_value, iteration)
@@ -701,13 +705,15 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                     lpips_test += lpips_value
                     window_psnr_test += window_psnr_value
                     opaque_psnr_test += opaque_psnr_value
+                    window_psnr_views += int(has_window)
+                    opaque_psnr_views += int(has_opaque)
 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])
-                window_psnr_test /= len(config['cameras'])
-                opaque_psnr_test /= len(config['cameras'])
+                window_psnr_test /= max(window_psnr_views, 1)
+                opaque_psnr_test /= max(opaque_psnr_views, 1)
                 print(f'\n[ITER {iteration}] Evaluating {config["name"]}: PSNR {psnr_test}, SSIM {ssim_test}, LPIPS {lpips_test}, Window PSNR {window_psnr_test}, Opaque PSNR {opaque_psnr_test}')
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)

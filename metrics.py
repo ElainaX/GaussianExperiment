@@ -20,7 +20,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from lpipsPyTorch import LPIPS
-from utils.image_utils import psnr
+from utils.image_utils import masked_psnr, psnr
 from utils.loss_utils import ssim
 
 lpips = LPIPS(net_type='vgg').cuda()
@@ -90,12 +90,14 @@ def evaluate(model_paths):
             masked_ssims = []
             masked_psnrs = []
             masked_lpips = []
+            masked_image_names = []
 
             for idx in tqdm(range(len(renders)), desc='Metric evaluation progress'):
                 if (masks[idx] > 0.5).any():
                     masked_ssims.append(ssim(renders[idx] * masks[idx], gts[idx] * masks[idx]))
-                    masked_psnrs.append(psnr(renders[idx] * masks[idx], gts[idx] * masks[idx]))
+                    masked_psnrs.append(masked_psnr(renders[idx], gts[idx], masks[idx]))
                     masked_lpips.append(lpips(renders[idx] * masks[idx], gts[idx] * masks[idx]))
+                    masked_image_names.append(image_names[idx])
 
             print('  Masked SSIM : {:>12.7f}'.format(torch.tensor(masked_ssims).mean(), ))
             print('  Masked PSNR : {:>12.7f}'.format(torch.tensor(masked_psnrs).mean(), ))
@@ -116,9 +118,9 @@ def evaluate(model_paths):
             )
             per_view_dict[scene_dir][method].update(
                 {
-                    'Masked SSIM': {name: ssim for ssim, name in zip(torch.tensor(masked_ssims).tolist(), image_names)},
-                    'Masked PSNR': {name: psnr for psnr, name in zip(torch.tensor(masked_psnrs).tolist(), image_names)},
-                    'Masked LPIPS': {name: lp for lp, name in zip(torch.tensor(masked_lpips).tolist(), image_names)},
+                    'Masked SSIM': {name: ssim for ssim, name in zip(torch.tensor(masked_ssims).tolist(), masked_image_names)},
+                    'Masked PSNR': {name: psnr for psnr, name in zip(torch.tensor(masked_psnrs).tolist(), masked_image_names)},
+                    'Masked LPIPS': {name: lp for lp, name in zip(torch.tensor(masked_lpips).tolist(), masked_image_names)},
                 }
             )
 
