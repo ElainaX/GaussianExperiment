@@ -1,7 +1,7 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="unreliable"
+EXPERIMENT_NAME="routing"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
@@ -94,6 +94,9 @@ TRAIN_CMD="python train.py \
     --glossy_target_reflectance 0.70 \
     --secondary_raytrace_on \
     --secondary_raytrace_strength 0.8 \
+    --secondary_raytrace_routing_on \
+    --secondary_raytrace_route_low 0.35 \
+    --secondary_raytrace_route_high 0.65 \
     --secondary_raytrace_glossy_low 0.15 \
     --secondary_raytrace_glossy_high 0.25 \
     --secondary_raytrace_roughness_max 0.25 \

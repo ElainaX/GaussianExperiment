@@ -94,3 +94,14 @@
 - 新增离线处理脚本，可直接组合已有 `vis` 中的 hit opacity 与 reliability PNG，无需重新训练或重新运行 3DGRT。
 - 离线递归处理时忽略 `.ipynb_checkpoints` 等隐藏目录，避免为编辑器缓存重复生成结果。
 - `tandt-eval.sh` 实验名改为 `unreliable`。
+
+## 2026-08-23：可靠性驱动的 3DGRT/SphMip 路由
+
+- 新增可关闭的 `secondary_raytrace_routing_on`，关闭时保持原 3DGRT 混合公式不变。
+- 将二次射线命中的多视角可靠性通过 Smoothstep 映射为路由分数；默认 `R≤0.35` 完全使用 SphMip，`R≥0.65` 使用 3DGRT，中间连续过渡。
+- 最终 3DGRT 权重为 glossy 材质权重乘路由分数；低可靠命中和未命中均回退到原环境贴图。
+- 路由分数停止梯度，不允许训练通过改变几何来操纵路由；可靠性追踪也不保留第二套 OptiX backward graph。
+- 新增 `secondary_raytrace_route_score_*` 灰度图和 `secondary_raytrace_route_heatmap_*` 彩色可视化。
+- 离线图片工具也可用相同阈值从已有 hit/reliability PNG 生成预测路由图，无需重新渲染。
+- 启用路由训练时强制要求多视角可靠性计算，避免所有高斯因缺少 `R` 而错误回退环境贴图。
+- `tandt-eval.sh` 实验名改为 `routing`。

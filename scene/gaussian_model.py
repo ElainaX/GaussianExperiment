@@ -122,8 +122,8 @@ class GaussianModel:
         self._prior_glossy_score = torch.empty(0)
         self.glossy_specular_boost = float(getattr(args, 'glossy_specular_boost', 1.0))
         self.glossy_update_count = 0
-        # Alpha-footprint support across training cameras. This fixed score is
-        # diagnostic-only until an explicit 3DGRT routing policy is enabled.
+        # Alpha-footprint support across training cameras. This fixed score can
+        # optionally route unreliable 3DGRT hits back to SphMip.
         self._raytrace_reliability = torch.empty(0)
         self.raytrace_reliability_update_count = 0
 
@@ -152,6 +152,25 @@ class GaussianModel:
         self.secondary_raytrace_from_iter = int(
             optional_arg('secondary_raytrace_from_iter', 30000)
         )
+        self.secondary_raytrace_routing_on = bool(
+            optional_arg('secondary_raytrace_routing_on', False)
+        )
+        self.secondary_raytrace_route_low = float(
+            optional_arg('secondary_raytrace_route_low', 0.35)
+        )
+        self.secondary_raytrace_route_high = float(
+            optional_arg('secondary_raytrace_route_high', 0.65)
+        )
+        if not 0.0 <= self.secondary_raytrace_route_low < self.secondary_raytrace_route_high <= 1.0:
+            raise ValueError(
+                'secondary raytrace routing thresholds must satisfy '
+                '0 <= low < high <= 1'
+            )
+        if self.secondary_raytrace_routing_on and not self.secondary_raytrace_on:
+            raise ValueError(
+                '--secondary_raytrace_routing_on requires '
+                '--secondary_raytrace_on'
+            )
         self._secondary_raytracer = None
         self._secondary_raytracer_options = {
             'thickness_ratio': float(

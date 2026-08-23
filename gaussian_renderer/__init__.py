@@ -10,6 +10,7 @@ from utils.camera_utils import *
 from utils.color_utils import *
 from utils.general_utils import *
 from utils.point_utils import *
+from utils.raytrace_utils import reliability_route_score
 from utils.sph_utils import *
 
 
@@ -206,6 +207,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
     secondary_gate = torch.zeros(1, image_height, image_width).cuda()
     secondary_hit_opacity = torch.zeros(1, image_height, image_width).cuda()
     secondary_reliability = torch.zeros(1, image_height, image_width).cuda()
+    secondary_route_score = torch.zeros(1, image_height, image_width).cuda()
 
     viewdirs = F.normalize(viewdirs, dim=-1)
     normal_map = surface_normal.movedim(0, -1)
@@ -278,22 +280,40 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                     position_map[ray_local_index] +
                     pc.secondary_raytrace_origin_epsilon * trace_directions
                 )
+                reliability_required = (
+                    pc.secondary_raytrace_routing_on or
+                    getattr(
+                        pipe,
+                        'secondary_raytrace_reliability_debug',
+                        False,
+                    )
+                )
                 ray_radiance, ray_opacity, ray_reliability = (
                     pc.get_secondary_raytracer().trace(
                         pc,
                         trace_origins,
                         trace_directions,
-                        return_reliability=getattr(
-                            pipe,
-                            'secondary_raytrace_reliability_debug',
-                            False,
-                        ),
+                        return_reliability=reliability_required,
                     )
                 )
                 material_weight = (
                     pc.secondary_raytrace_strength *
                     ray_gate[ray_local_index]
                 ).clamp(0.0, 1.0)
+                if pc.secondary_raytrace_routing_on:
+                    if ray_reliability is None:
+                        raise RuntimeError(
+                            'Reliability routing requires per-ray reliability'
+                        )
+                    route_score = reliability_route_score(
+                        ray_reliability.detach(),
+                        pc.secondary_raytrace_route_low,
+                        pc.secondary_raytrace_route_high,
+                    )
+                else:
+                    # Exact legacy behavior when routing is disabled.
+                    route_score = torch.ones_like(material_weight)
+                routed_material_weight = material_weight * route_score
                 global_spec_light = spec_light[ray_local_index]
                 # 3DGRT returns radiance composited over black. Preserve the
                 # existing SphMip environment for the unoccluded transmittance
@@ -303,15 +323,15 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                 )
                 spec_light = spec_light.clone()
                 spec_light[ray_local_index] = (
-                    global_spec_light * (1.0 - material_weight) +
-                    traced_spec_light * material_weight
+                    global_spec_light * (1.0 - routed_material_weight) +
+                    traced_spec_light * routed_material_weight
                 )
                 pixel_index = select_index[ray_local_index]
                 secondary_radiance.reshape(3, -1)[:, pixel_index] = (
                     ray_radiance.transpose(0, 1)
                 )
                 secondary_gate.reshape(1, -1)[:, pixel_index] = (
-                    (material_weight * ray_opacity).transpose(0, 1)
+                    (routed_material_weight * ray_opacity).transpose(0, 1)
                 )
                 secondary_hit_opacity.reshape(1, -1)[:, pixel_index] = (
                     ray_opacity.transpose(0, 1)
@@ -320,6 +340,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                     secondary_reliability.reshape(1, -1)[:, pixel_index] = (
                         ray_reliability.transpose(0, 1)
                     )
+                secondary_route_score.reshape(1, -1)[:, pixel_index] = (
+                    route_score.mul(ray_opacity > 1e-6).transpose(0, 1)
+                )
 
         render_spec.reshape(3, -1)[:, select_index] = spec_light.transpose(0, 1)
         render_attenuation.reshape(1, -1)[:, select_index] = spec_attenuation.transpose(0, 1)
@@ -355,6 +378,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
         'secondary_raytrace_gate': secondary_gate,
         'secondary_raytrace_hit_opacity': secondary_hit_opacity,
         'secondary_raytrace_reliability': secondary_reliability,
+        'secondary_raytrace_route_score': secondary_route_score,
         'surface_position': render_position,
         'transmissivity': render_transmissivity,
         'attenuation': render_attenuation,

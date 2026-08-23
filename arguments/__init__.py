@@ -79,6 +79,10 @@ class ModelParams(ParamGroup):
         self.secondary_raytrace_rebuild_interval = 1
         self.secondary_raytrace_min_transmittance = 0.03
         self.secondary_raytrace_from_iter = 30000
+        # Route unreliable 3DGRT hits back to the original SphMip environment.
+        self.secondary_raytrace_routing_on = False
+        self.secondary_raytrace_route_low = 0.35
+        self.secondary_raytrace_route_high = 0.65
 
         self.env_scope_center = [0.0, 0.0, 0.0]
         self.env_scope_radius = 0.0
@@ -102,8 +106,8 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.init_stage = False
         self.disable_secondary_raytrace = False
-        # Export-only extra 3DGRT pass that integrates per-Gaussian reliability.
-        # Keep false during training to avoid doubling secondary-ray work.
+        # Export-only request for the reliability pass. Reliability routing
+        # forces the same pass during both training and export when enabled.
         self.secondary_raytrace_reliability_debug = False
         super().__init__(parser, 'Pipeline Parameters')
 
@@ -159,8 +163,8 @@ class OptimizationParams(ParamGroup):
         self.glossy_normal_rate_margin = 0.002
         self.glossy_normal_rate_min_alpha = 0.05
         self.glossy_normal_rate_radius = 1
-        # Multi-view alpha-footprint reliability for 3DGRT diagnostics. The
-        # score is computed after densification and does not alter tracing yet.
+        # Multi-view alpha-footprint reliability for 3DGRT diagnostics and
+        # optional environment/RT routing after densification.
         self.raytrace_reliability_on = False
         self.raytrace_reliability_from_iter = 15000
         self.raytrace_reliability_until_iter = 30000

@@ -216,8 +216,20 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, secondary_radiance_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_radiance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_gate'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_gate_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_hit_opacity'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_hit_opacity_{0:05d}'.format(i) + '.png'))
-                    if getattr(self.prior_options, 'secondary_raytrace_reliability_debug', False):
+                    reliability_output_on = (
+                        getattr(self.prior_options, 'secondary_raytrace_reliability_debug', False) or
+                        getattr(self.prior_options, 'secondary_raytrace_routing_on', False)
+                    )
+                    if reliability_output_on:
                         executor.submit(save_img_u8, render_pkg['secondary_raytrace_reliability'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_reliability_{0:05d}'.format(i) + '.png'))
+                        executor.submit(save_img_u8, render_pkg['secondary_raytrace_route_score'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_route_score_{0:05d}'.format(i) + '.png'))
+                        route_heatmap = apply_colormap(render_pkg['secondary_raytrace_route_score'])
+                        route_heatmap[:, render_pkg['secondary_raytrace_hit_opacity'][0].cpu() <= 1e-6] = 0.0
+                        executor.submit(
+                            save_img_u8,
+                            route_heatmap.permute(1, 2, 0).numpy(),
+                            os.path.join(vis_path, f'secondary_raytrace_route_heatmap_{i:05d}.png'),
+                        )
                         unreliable_hit = (
                             render_pkg['secondary_raytrace_hit_opacity'] *
                             (1.0 - render_pkg['secondary_raytrace_reliability'])

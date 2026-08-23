@@ -83,7 +83,23 @@ if __name__ == '__main__':
         'OFF (forced)' if pipe.disable_secondary_raytrace else
         ('ON (3DGRT)' if dataset.secondary_raytrace_on else 'OFF')
     )
-    print(f'Secondary ray tracing: {raytrace_mode}; output method: {method_name}')
+    routing_mode = (
+        f'ON (R={gaussians.secondary_raytrace_route_low:.2f}..'
+        f'{gaussians.secondary_raytrace_route_high:.2f})'
+        if gaussians.secondary_raytrace_routing_on else 'OFF'
+    )
+    print(
+        f'Secondary ray tracing: {raytrace_mode}; reliability routing: '
+        f'{routing_mode}; output method: {method_name}'
+    )
+    if (
+        gaussians.secondary_raytrace_routing_on and
+        gaussians.raytrace_reliability_update_count == 0
+    ):
+        print(
+            'Warning: routing is enabled but the loaded PLY has no reliability '
+            'field; all secondary hits will fall back to SphMip.'
+        )
     gaussExtractor = GaussianExtractor(
         gaussians,
         partial(render, pipe=pipe),

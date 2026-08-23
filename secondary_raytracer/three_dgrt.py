@@ -309,20 +309,23 @@ class ThreeDGRTSecondaryTracer:
                 gaussians.get_raytrace_reliability.clamp(0.0, 1.0) - 0.5
             ) / sh_c0
             reliability_features[:, :3] = reliability_dc.expand(-1, 3)
-            reliability_radiance, _ = _TraceRays.apply(
-                self.wrapper,
-                self._frame_id + 1,
-                ray_to_world,
-                rays_o,
-                rays_d,
-                gaussians.get_xyz,
-                gaussians.get_rotation,
-                scales,
-                gaussians.get_occupancy,
-                reliability_features,
-                0,
-                self.min_transmittance,
-            )
+            # R_g is a fixed routing signal, not a trainable appearance target.
+            # Avoid retaining a second OptiX backward graph for this pass.
+            with torch.no_grad():
+                reliability_radiance, _ = _TraceRays.apply(
+                    self.wrapper,
+                    self._frame_id + 1,
+                    ray_to_world,
+                    rays_o,
+                    rays_d,
+                    gaussians.get_xyz,
+                    gaussians.get_rotation,
+                    scales,
+                    gaussians.get_occupancy,
+                    reliability_features,
+                    0,
+                    self.min_transmittance,
+                )
             flat_opacity = opacity.reshape(-1, 1).clamp(0.0, 1.0)
             reliability_numerator = reliability_radiance.reshape(
                 -1, 3

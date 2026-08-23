@@ -1,4 +1,4 @@
-"""Build unreliable-3DGRT-hit maps from an existing render ``vis`` folder.
+"""Build unreliable-hit and routing maps from an existing render ``vis`` folder.
 
 The score is ``hit_opacity * (1 - reliability)``. Therefore an untraced or
 missed pixel remains zero instead of being mistaken for an unreliable hit.
@@ -15,7 +15,9 @@ from PIL import Image
 HIT_PREFIX = 'secondary_raytrace_hit_opacity_'
 RELIABILITY_PREFIX = 'secondary_raytrace_reliability_'
 RAW_PREFIX = 'secondary_raytrace_unreliable_hit_'
-HEATMAP_PREFIX = 'secondary_raytrace_unreliable_hit_heatmap_'
+UNRELIABLE_HEATMAP_PREFIX = 'secondary_raytrace_unreliable_hit_heatmap_'
+ROUTE_PREFIX = 'secondary_raytrace_route_score_'
+ROUTE_HEATMAP_PREFIX = 'secondary_raytrace_route_heatmap_'
 
 
 def compute_unreliable_hit(hit_opacity, reliability):
@@ -26,6 +28,23 @@ def compute_unreliable_hit(hit_opacity, reliability):
             f'{reliability.shape}'
         )
     return np.clip(hit_opacity * (1.0 - reliability), 0.0, 1.0)
+
+
+def compute_route_score(hit_opacity, reliability, low=0.35, high=0.65):
+    """Return smooth RT routing confidence, with misses fixed to zero."""
+    if hit_opacity.shape != reliability.shape:
+        raise ValueError(
+            f'Hit/reliability shapes differ: {hit_opacity.shape} vs '
+            f'{reliability.shape}'
+        )
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError(
+            f'Routing thresholds must satisfy 0 <= low < high <= 1, '
+            f'got low={low}, high={high}'
+        )
+    normalized = np.clip((reliability - low) / (high - low), 0.0, 1.0)
+    route = normalized * normalized * (3.0 - 2.0 * normalized)
+    return np.where(hit_opacity > 0.0, route, 0.0)
 
 
 def load_gray(path):
@@ -56,7 +75,7 @@ def find_vis_dirs(root):
     })
 
 
-def process_vis_dir(vis_dir, overwrite=False):
+def process_vis_dir(vis_dir, route_low=0.35, route_high=0.65, overwrite=False):
     written = 0
     missing = 0
     for hit_path in sorted(vis_dir.glob(f'{HIT_PREFIX}*.png')):
@@ -68,22 +87,33 @@ def process_vis_dir(vis_dir, overwrite=False):
             continue
 
         raw_path = vis_dir / f'{RAW_PREFIX}{suffix}'
-        heatmap_path = vis_dir / f'{HEATMAP_PREFIX}{suffix}'
-        if not overwrite and raw_path.exists() and heatmap_path.exists():
+        heatmap_path = vis_dir / f'{UNRELIABLE_HEATMAP_PREFIX}{suffix}'
+        route_path = vis_dir / f'{ROUTE_PREFIX}{suffix}'
+        route_heatmap_path = vis_dir / f'{ROUTE_HEATMAP_PREFIX}{suffix}'
+        output_paths = [raw_path, heatmap_path, route_path, route_heatmap_path]
+        if not overwrite and all(path.exists() for path in output_paths):
             continue
 
         hit_opacity = load_gray(hit_path)
         reliability = load_gray(reliability_path)
         score = compute_unreliable_hit(hit_opacity, reliability)
+        route_score = compute_route_score(
+            hit_opacity,
+            reliability,
+            low=route_low,
+            high=route_high,
+        )
         save_gray(score, raw_path)
         save_heatmap(score, hit_opacity, heatmap_path)
+        save_gray(route_score, route_path)
+        save_heatmap(route_score, hit_opacity, route_heatmap_path)
         written += 1
     return written, missing
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Combine 3DGRT hit opacity and reliability into an unreliable-hit heatmap.'
+        description='Build 3DGRT unreliable-hit and reliability-routing heatmaps.'
     )
     parser.add_argument(
         'root',
@@ -91,6 +121,8 @@ def main():
         help='A vis folder or an experiment/model directory containing vis folders.',
     )
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--route-low', type=float, default=0.35)
+    parser.add_argument('--route-high', type=float, default=0.65)
     args = parser.parse_args()
 
     vis_dirs = find_vis_dirs(args.root)
@@ -100,7 +132,12 @@ def main():
     total_written = 0
     total_missing = 0
     for vis_dir in vis_dirs:
-        written, missing = process_vis_dir(vis_dir, overwrite=args.overwrite)
+        written, missing = process_vis_dir(
+            vis_dir,
+            route_low=args.route_low,
+            route_high=args.route_high,
+            overwrite=args.overwrite,
+        )
         total_written += written
         total_missing += missing
         print(f'{vis_dir}: wrote {written} pair(s), missing {missing}')

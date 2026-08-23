@@ -155,6 +155,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
         if not 0.0 <= opt.raytrace_reliability_ema < 1.0:
             raise ValueError('raytrace_reliability_ema must be in [0, 1)')
+    if dataset.secondary_raytrace_routing_on and not opt.raytrace_reliability_on:
+        raise ValueError(
+            '--secondary_raytrace_routing_on requires '
+            '--raytrace_reliability_on during training'
+        )
+    if dataset.secondary_raytrace_routing_on:
+        print(
+            '[3DGRT-ROUTING] SphMip below R='
+            f'{dataset.secondary_raytrace_route_low:.2f}; 3DGRT above R='
+            f'{dataset.secondary_raytrace_route_high:.2f}'
+        )
     if opt.lambda_glossy_normal_rate > 0:
         if not opt.glossy_prior_on:
             raise ValueError(
