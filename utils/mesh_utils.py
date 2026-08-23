@@ -216,7 +216,24 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, secondary_radiance_vis.permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_radiance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_gate'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_gate_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['secondary_raytrace_hit_opacity'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_hit_opacity_{0:05d}'.format(i) + '.png'))
-                    executor.submit(save_img_u8, render_pkg['secondary_raytrace_reliability'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_reliability_{0:05d}'.format(i) + '.png'))
+                    if getattr(self.prior_options, 'secondary_raytrace_reliability_debug', False):
+                        executor.submit(save_img_u8, render_pkg['secondary_raytrace_reliability'][0].cpu().numpy(), os.path.join(vis_path, 'secondary_raytrace_reliability_{0:05d}'.format(i) + '.png'))
+                        unreliable_hit = (
+                            render_pkg['secondary_raytrace_hit_opacity'] *
+                            (1.0 - render_pkg['secondary_raytrace_reliability'])
+                        ).clamp(0.0, 1.0)
+                        unreliable_hit_heatmap = apply_colormap(unreliable_hit)
+                        unreliable_hit_heatmap[:, render_pkg['secondary_raytrace_hit_opacity'][0].cpu() <= 1e-6] = 0.0
+                        executor.submit(
+                            save_img_u8,
+                            unreliable_hit[0].cpu().numpy(),
+                            os.path.join(vis_path, f'secondary_raytrace_unreliable_hit_{i:05d}.png'),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            unreliable_hit_heatmap.permute(1, 2, 0).numpy(),
+                            os.path.join(vis_path, f'secondary_raytrace_unreliable_hit_heatmap_{i:05d}.png'),
+                        )
                     executor.submit(save_img_u8, render_pkg['render_tran'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'transmitted_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))

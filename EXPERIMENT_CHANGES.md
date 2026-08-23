@@ -85,3 +85,11 @@
 - `metrics.py` 输出的 `Masked PSNR` 使用同一套有效像素统计，保留原 JSON 字段名以兼容已有分析脚本。
 - Masked SSIM 与 Masked LPIPS 的历史定义暂时保持不变；本次只修正用户指定的 PSNR。
 - `tandt-eval.sh` 实验名改为 `maskpsnr`。
+
+## 2026-08-23：3DGRT 不可靠命中 Heatmap
+
+- 新增不可靠命中分数 `U = hit_opacity × (1 - reliability)`，只有实际命中且命中高斯可靠性低时才产生高响应。
+- 开启 reliability debug 时，`vis` 同时导出灰度分数 `secondary_raytrace_unreliable_hit_*` 和 Turbo 彩色图 `secondary_raytrace_unreliable_hit_heatmap_*`。
+- 彩色图中未发射或未命中的像素强制为黑色；命中越不可靠，颜色由蓝色逐渐变为黄色、红色。
+- 新增离线处理脚本，可直接组合已有 `vis` 中的 hit opacity 与 reliability PNG，无需重新训练或重新运行 3DGRT。
+- `tandt-eval.sh` 实验名改为 `unreliable`。
