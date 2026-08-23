@@ -49,7 +49,11 @@ def find_vis_dirs(root):
         raise ValueError(f'Expected a directory, got file: {root}')
     if any(root.glob(f'{HIT_PREFIX}*.png')):
         return [root]
-    return sorted({path.parent for path in root.rglob(f'{HIT_PREFIX}*.png')})
+    return sorted({
+        path.parent
+        for path in root.rglob(f'{HIT_PREFIX}*.png')
+        if not any(part.startswith('.') for part in path.relative_to(root).parts)
+    })
 
 
 def process_vis_dir(vis_dir, overwrite=False):

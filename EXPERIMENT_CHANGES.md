@@ -92,4 +92,5 @@
 - 开启 reliability debug 时，`vis` 同时导出灰度分数 `secondary_raytrace_unreliable_hit_*` 和 Turbo 彩色图 `secondary_raytrace_unreliable_hit_heatmap_*`。
 - 彩色图中未发射或未命中的像素强制为黑色；命中越不可靠，颜色由蓝色逐渐变为黄色、红色。
 - 新增离线处理脚本，可直接组合已有 `vis` 中的 hit opacity 与 reliability PNG，无需重新训练或重新运行 3DGRT。
+- 离线递归处理时忽略 `.ipynb_checkpoints` 等隐藏目录，避免为编辑器缓存重复生成结果。
 - `tandt-eval.sh` 实验名改为 `unreliable`。
