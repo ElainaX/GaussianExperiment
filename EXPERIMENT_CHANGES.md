@@ -105,3 +105,16 @@
 - 离线图片工具也可用相同阈值从已有 hit/reliability PNG 生成预测路由图，无需重新渲染。
 - 启用路由训练时强制要求多视角可靠性计算，避免所有高斯因缺少 `R` 而错误回退环境贴图。
 - `tandt-eval.sh` 实验名改为 `routing`。
+
+## 2026-08-23：使用 Glossy 区域替代训练透明 Mask
+
+- 将 occupancy–optical-opacity 分解的允许区域改为停止梯度的 glossy score Smoothstep gate。
+- 高 glossy 只放开分解，不直接监督为透明；低 glossy 区域约束 optical opacity 接近 1、transmissivity 接近 0。
+- consistency loss 改为使用连续 glossy 权重，并安全处理没有有效 glossy 像素的视角。
+- 新增语义明确的 `optical_opacity_loss_weight`；旧 `mask_loss_weight` 仅作为未显式设置新参数时的兼容回退。
+- glossy 分解 loss 不早于第一次 glossy score 更新，避免用全零 gate 错把所有表面约束成不透明。
+- `transparent_masks` 改成可选数据：训练不再要求存在，仍可用于独立的 Window/Masked 指标评估。
+- 保留 `gt_mask` 和 `none` 区域模式，便于与论文原始方法及关闭分解正则进行消融。
+- 新增 `decomposition_gate_*` 可视化，并让 specular 梯度门控拥有独立的起始迭代参数。
+- 指标脚本忽略缓存目录和非图片文件；没有 mask 时只跳过 Masked 指标，不影响全图指标。
+- 本实验目录名改为 `maskfree`。

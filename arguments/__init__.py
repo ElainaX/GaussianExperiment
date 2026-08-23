@@ -175,6 +175,17 @@ class OptimizationParams(ParamGroup):
         self.raytrace_reliability_full_pixel_mass = 16.0
         self.raytrace_reliability_ema = 0.5
         self.occupancy_decay_weight = 0.001
+        # Region in which occupancy/optical-opacity decomposition is allowed.
+        # glossy: use detached rendered glossy score; gt_mask: legacy mask;
+        # none: disable the opacity/transmissivity decomposition regularizers.
+        self.decomposition_region_source = 'none'
+        self.decomposition_from_iter = -1
+        self.decomposition_glossy_low = 0.15
+        self.decomposition_glossy_high = 0.30
+        self.specular_gating_from_iter = -1
+        # Legacy option names are retained as regularizer weights so old
+        # experiment configs remain loadable.
+        self.optical_opacity_loss_weight = -1.0
         self.mask_loss_weight = 0.01
         self.mask_loss_from_iter = -1
         self.transmissivity_loss_weight = 0.01

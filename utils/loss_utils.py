@@ -110,3 +110,25 @@ def binary_cross_entropy(input, target):
     F.binary_cross_entropy is not numerically stable in mixed-precision training.
     """
     return -(target * torch.log(input + 1e-10) + (1 - target) * torch.log(1 - input + 1e-10)).mean()
+
+
+def smoothstep_gate(value, low, high):
+    """Convert a score map to a smooth region gate."""
+    if high <= low:
+        raise ValueError('smoothstep high must be greater than low')
+    x = ((value - low) / (high - low)).clamp(0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def weighted_binary_cross_entropy(input, target, weight):
+    """Numerically stable BCE averaged over positive-weight pixels only."""
+    if not torch.is_tensor(target):
+        target = torch.full_like(input, float(target))
+    else:
+        target = torch.broadcast_to(target.to(input), input.shape)
+    weight = torch.broadcast_to(weight.to(input), input.shape)
+    elementwise = -(
+        target * torch.log(input + 1e-10) +
+        (1 - target) * torch.log(1 - input + 1e-10)
+    )
+    return (elementwise * weight).sum() / weight.sum().clamp_min(1e-10)

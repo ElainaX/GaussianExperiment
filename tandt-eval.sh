@@ -1,7 +1,7 @@
 set -euo pipefail
 
 # Keep this tag short and update it whenever the experiment purpose changes.
-EXPERIMENT_NAME="routing"
+EXPERIMENT_NAME="maskfree"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 COMMIT_DATE="$(git -C "$SCRIPT_DIR" show -s --date=format:%m%d --format=%cd HEAD)"
@@ -69,6 +69,12 @@ TRAIN_CMD="python train.py \
     --raytrace_reliability_full_pixel_mass 16.0 \
     --raytrace_reliability_ema 0.5 \
     --glossy_prior_on \
+    --decomposition_region_source glossy \
+    --decomposition_from_iter 5000 \
+    --decomposition_glossy_low 0.15 \
+    --decomposition_glossy_high 0.30 \
+    --optical_opacity_loss_weight 0.01 \
+    --specular_gating_from_iter 700 \
     --glossy_from_iter 5000 \
     --glossy_interval 500 \
     --glossy_num_cams 8 \

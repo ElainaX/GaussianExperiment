@@ -26,19 +26,33 @@ from utils.loss_utils import ssim
 lpips = LPIPS(net_type='vgg').cuda()
 
 
-def readImages(renders_dir, gt_dir, masks_dir):
+def readImages(renders_dir, gt_dir, masks_dir=None):
     renders = []
     gts = []
     masks = []
     image_names = []
-    for fname in sorted(os.listdir(renders_dir)):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        mask = Image.open(masks_dir / fname)
+    image_suffixes = {'.png', '.jpg', '.jpeg'}
+    render_files = sorted(
+        path for path in renders_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in image_suffixes
+    )
+    for render_path in render_files:
+        fname = render_path.name
+        gt_path = gt_dir / fname
+        if not gt_path.is_file():
+            print(f'[Warning] Skipping render without matching GT: {fname}')
+            continue
+        render = Image.open(render_path)
+        gt = Image.open(gt_path)
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
         gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        mask_tensor = tf.to_tensor(mask.convert('L')).unsqueeze(0).cuda()
-        masks.append((mask_tensor > 0.5).float())
+        mask_path = masks_dir / fname if masks_dir is not None else None
+        if mask_path is not None and mask_path.is_file():
+            mask = Image.open(mask_path)
+            mask_tensor = tf.to_tensor(mask.convert('L')).unsqueeze(0).cuda()
+            masks.append((mask_tensor > 0.5).float())
+        else:
+            masks.append(None)
         image_names.append(fname)
 
     return renders, gts, masks, image_names
@@ -59,7 +73,12 @@ def evaluate(model_paths):
 
         test_dir = Path(scene_dir) / 'test'
 
-        for method in os.listdir(test_dir):
+        method_dirs = sorted(
+            path for path in test_dir.iterdir()
+            if path.is_dir() and (path / 'renders').is_dir() and (path / 'gt').is_dir()
+        )
+        for method_dir in method_dirs:
+            method = method_dir.name
             print('Method:', method)
 
             full_dict[scene_dir][method] = {}
@@ -67,11 +86,14 @@ def evaluate(model_paths):
             full_dict_polytopeonly[scene_dir][method] = {}
             per_view_dict_polytopeonly[scene_dir][method] = {}
 
-            method_dir = test_dir / method
             gt_dir = method_dir / 'gt'
             renders_dir = method_dir / 'renders'
             masks_dir = method_dir / 'transparent_masks'
-            renders, gts, masks, image_names = readImages(renders_dir, gt_dir, masks_dir)
+            renders, gts, masks, image_names = readImages(
+                renders_dir,
+                gt_dir,
+                masks_dir if masks_dir.is_dir() else None,
+            )
 
             ssims = []
             psnrs = []
@@ -93,16 +115,20 @@ def evaluate(model_paths):
             masked_image_names = []
 
             for idx in tqdm(range(len(renders)), desc='Metric evaluation progress'):
-                if (masks[idx] > 0.5).any():
+                if masks[idx] is not None and (masks[idx] > 0.5).any():
                     masked_ssims.append(ssim(renders[idx] * masks[idx], gts[idx] * masks[idx]))
                     masked_psnrs.append(masked_psnr(renders[idx], gts[idx], masks[idx]))
                     masked_lpips.append(lpips(renders[idx] * masks[idx], gts[idx] * masks[idx]))
                     masked_image_names.append(image_names[idx])
 
-            print('  Masked SSIM : {:>12.7f}'.format(torch.tensor(masked_ssims).mean(), ))
-            print('  Masked PSNR : {:>12.7f}'.format(torch.tensor(masked_psnrs).mean(), ))
-            print('  Masked LPIPS: {:>12.7f}'.format(torch.tensor(masked_lpips).mean(), ))
-            print('')
+            if masked_ssims:
+                print('  Masked SSIM : {:>12.7f}'.format(torch.tensor(masked_ssims).mean(), ))
+                print('  Masked PSNR : {:>12.7f}'.format(torch.tensor(masked_psnrs).mean(), ))
+                print('  Masked LPIPS: {:>12.7f}'.format(torch.tensor(masked_lpips).mean(), ))
+                print('')
+            else:
+                print('  Masked metrics: skipped (no optional masks found)')
+                print('')
 
             full_dict[scene_dir][method].update({'SSIM': torch.tensor(ssims).mean().item(), 'PSNR': torch.tensor(psnrs).mean().item(), 'LPIPS': torch.tensor(lpipss).mean().item()})
             per_view_dict[scene_dir][method].update(
@@ -113,16 +139,17 @@ def evaluate(model_paths):
                 }
             )
 
-            full_dict[scene_dir][method].update(
-                {'Masked SSIM': torch.tensor(masked_ssims).mean().item(), 'Masked PSNR': torch.tensor(masked_psnrs).mean().item(), 'Masked LPIPS': torch.tensor(masked_lpips).mean().item()}
-            )
-            per_view_dict[scene_dir][method].update(
-                {
-                    'Masked SSIM': {name: ssim for ssim, name in zip(torch.tensor(masked_ssims).tolist(), masked_image_names)},
-                    'Masked PSNR': {name: psnr for psnr, name in zip(torch.tensor(masked_psnrs).tolist(), masked_image_names)},
-                    'Masked LPIPS': {name: lp for lp, name in zip(torch.tensor(masked_lpips).tolist(), masked_image_names)},
-                }
-            )
+            if masked_ssims:
+                full_dict[scene_dir][method].update(
+                    {'Masked SSIM': torch.tensor(masked_ssims).mean().item(), 'Masked PSNR': torch.tensor(masked_psnrs).mean().item(), 'Masked LPIPS': torch.tensor(masked_lpips).mean().item()}
+                )
+                per_view_dict[scene_dir][method].update(
+                    {
+                        'Masked SSIM': {name: ssim for ssim, name in zip(torch.tensor(masked_ssims).tolist(), masked_image_names)},
+                        'Masked PSNR': {name: psnr for psnr, name in zip(torch.tensor(masked_psnrs).tolist(), masked_image_names)},
+                        'Masked LPIPS': {name: lp for lp, name in zip(torch.tensor(masked_lpips).tolist(), masked_image_names)},
+                    }
+                )
 
         with open(scene_dir + '/results.json', 'w') as fp:
             json.dump(full_dict[scene_dir], fp, indent=True)

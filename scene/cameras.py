@@ -71,7 +71,11 @@ class Camera(nn.Module):
         self._prior_normal_u8_cache = None
         self._prior_roughness_u8_cache = None
 
-        self.gt_transparent_mask = gt_transparent_mask.to(self.data_device)
+        self.gt_transparent_mask = (
+            gt_transparent_mask.to(self.data_device)
+            if gt_transparent_mask is not None
+            else None
+        )
 
         if gt_alpha_mask is not None:
             self.gt_alpha_mask = gt_alpha_mask.to(self.data_device)
@@ -89,6 +93,10 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0, 1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    @property
+    def has_transparent_mask(self):
+        return self.gt_transparent_mask is not None
 
     @property
     def has_image_priors(self):

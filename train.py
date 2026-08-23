@@ -32,7 +32,13 @@ from utils.fast_utils import (  # [FASTGS / GLOSSY PRIOR]
 )
 from utils.general_utils import GaussianTracker, safe_state
 from utils.image_utils import apply_colormap, local_variance, log_normalize, masked_psnr, psnr
-from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
+from utils.loss_utils import (
+    l1_loss,
+    lpips,
+    smoothstep_gate,
+    ssim,
+    weighted_binary_cross_entropy,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -55,6 +61,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (
             name.startswith('glossy_') or
             name.startswith('normal_prior_') or
+            name.startswith('decomposition_') or
             name in ('lambda_normal_prior', 'lambda_glossy_normal_rate')
         ):
             setattr(dataset, name, value)
@@ -98,6 +105,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     roughness_threshold = float(opt.glossy_prior_roughness_threshold)
     if not 0.0 <= roughness_threshold <= 1.0:
         raise ValueError('glossy_prior_roughness_threshold must be in [0, 1]')
+    decomposition_source = str(opt.decomposition_region_source).lower()
+    if decomposition_source not in ('glossy', 'gt_mask', 'none'):
+        raise ValueError(
+            'decomposition_region_source must be glossy, gt_mask, or none'
+        )
+    if opt.decomposition_glossy_high <= opt.decomposition_glossy_low:
+        raise ValueError(
+            'decomposition_glossy_high must be greater than '
+            'decomposition_glossy_low'
+        )
+    if decomposition_source == 'glossy' and not opt.glossy_prior_on:
+        raise ValueError(
+            '--decomposition_region_source glossy requires --glossy_prior_on'
+        )
+    if decomposition_source == 'gt_mask':
+        mask_views = sum(camera.has_transparent_mask for camera in viewpoint_stack)
+        if mask_views != len(viewpoint_stack):
+            raise ValueError(
+                '--decomposition_region_source gt_mask requires a '
+                'transparent mask for every training view'
+            )
+    decomposition_from_iter = int(opt.decomposition_from_iter)
+    if decomposition_from_iter < 0:
+        decomposition_from_iter = (
+            int(opt.mask_loss_from_iter)
+            if opt.mask_loss_from_iter >= 0
+            else int(opt.init_until_iter)
+        )
+    if (
+        decomposition_source == 'glossy' and
+        decomposition_from_iter < int(opt.glossy_from_iter)
+    ):
+        print(
+            '[DECOMPOSITION] delaying glossy-region losses from '
+            f'{decomposition_from_iter} to first score update '
+            f'{opt.glossy_from_iter}'
+        )
+        decomposition_from_iter = int(opt.glossy_from_iter)
+    specular_gating_from_iter = int(opt.specular_gating_from_iter)
+    if specular_gating_from_iter < 0:
+        specular_gating_from_iter = decomposition_from_iter
+    optical_opacity_loss_weight = float(opt.optical_opacity_loss_weight)
+    if optical_opacity_loss_weight < 0:
+        optical_opacity_loss_weight = float(opt.mask_loss_weight)
+    print(
+        '[DECOMPOSITION] source='
+        f'{decomposition_source} from_iter={decomposition_from_iter}; '
+        f'specular_gating_from_iter={specular_gating_from_iter}'
+    )
     if opt.raytrace_reliability_on:
         if not dataset.secondary_raytrace_on:
             raise ValueError(
@@ -232,7 +288,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         data_idx = np.random.randint(len(viewpoint_stack))
         viewpoint_cam = viewpoint_stack[data_idx]
         gt_image = viewpoint_cam.original_image.cuda()
-        gt_transparent_mask = viewpoint_cam.gt_transparent_mask.cuda()  # True=透明区域
+        gt_transparent_mask = viewpoint_cam.gt_transparent_mask
+        if gt_transparent_mask is not None:
+            gt_transparent_mask = gt_transparent_mask.cuda()  # True=透明区域
 
         # 若 GT 有 alpha 通道（RGBA），用随机背景色合成，增强对透明区域的泛化
         if gt_image.shape[0] == 4:
@@ -289,7 +347,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_dict['diff'] = loss_diff.item()
         # === 阶段 C：完整 PBR 阶段（>= init_until_iter）===
         else:
-            if iteration < opt.mask_loss_from_iter:
+            if iteration < specular_gating_from_iter:
                 # mask loss 还没开启，直接用合成图
                 detached_rendering = final_rendering
             else:
@@ -400,33 +458,74 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += dist_loss
             loss_dict['dist'] = dist_loss.item()
 
-        # === Mask loss：监督不透明度与 GT 透明 mask 的一致性（BCE） ===
-        if opt.mask_loss_from_iter == -1:
-            opt.mask_loss_from_iter = opt.init_until_iter
-        if opt.mask_loss_weight > 0 and iteration >= opt.mask_loss_from_iter:
-            mask_loss = opt.mask_loss_weight * binary_cross_entropy(1 - surface_opacity, gt_transparent_mask.squeeze(0) * 1.0)
-            loss += mask_loss
-            loss_dict['mask'] = mask_loss.item()
+        # === Occupancy/optical-opacity decomposition region ===
+        # High glossy score only permits decomposition; it is not treated as
+        # ground-truth transparency. Outside the gate, visible surfaces are
+        # constrained to optical opacity 1 and transmissivity 0.
+        decomposition_gate = None
+        if decomposition_source == 'glossy':
+            decomposition_gate = smoothstep_gate(
+                render_pkg['glossy_score'].detach(),
+                float(opt.decomposition_glossy_low),
+                float(opt.decomposition_glossy_high),
+            )
+        elif decomposition_source == 'gt_mask':
+            decomposition_gate = gt_transparent_mask.float()
 
-        # === Transmissivity loss：不透明区域的透明度应接近 0（BCE 强制为二值） ===
-        if iteration >= opt.init_until_iter:
-            transmissivity_loss = opt.transmissivity_loss_weight * binary_cross_entropy(transmissivity[~gt_transparent_mask], 0)
-            loss += transmissivity_loss
-            loss_dict['transmissivity'] = transmissivity_loss.item()
+        if (
+            decomposition_gate is not None and
+            iteration >= decomposition_from_iter
+        ):
+            surface_support = (
+                render_pkg['surface_alpha'].detach().clamp(0.0, 1.0) *
+                foreground.detach().clamp(0.0, 1.0)
+            )
+            opaque_weight = (1.0 - decomposition_gate) * surface_support
+            glossy_weight = decomposition_gate * surface_support
 
-        # === Consistency loss：透明区域内的 transmissivity 和 scatter 应当均匀，减少噪声 ===
-        if opt.consistency_loss_weight > 0 and iteration >= opt.init_until_iter:
-            consistency_loss = 0
-            tran_vals = transmissivity[gt_transparent_mask]
-            tran_mean = tran_vals.mean()
-            consistency_loss += opt.consistency_loss_weight * ((tran_vals - tran_mean) ** 2).sum()
+            if optical_opacity_loss_weight > 0:
+                optical_opacity_loss = (
+                    optical_opacity_loss_weight * weighted_binary_cross_entropy(
+                        surface_opacity,
+                        1.0,
+                        opaque_weight,
+                    )
+                )
+                loss += optical_opacity_loss
+                loss_dict['optical_opacity'] = optical_opacity_loss.item()
 
-            scatter_vals = render_scat[:, gt_transparent_mask.squeeze(0)]
-            scatter_mean = scatter_vals.mean(dim=-1, keepdim=True)
-            consistency_loss += opt.consistency_loss_weight * ((scatter_vals - scatter_mean) ** 2).sum(dim=-1).mean()
+            if opt.transmissivity_loss_weight > 0:
+                transmissivity_loss = (
+                    opt.transmissivity_loss_weight *
+                    weighted_binary_cross_entropy(
+                        transmissivity,
+                        0.0,
+                        opaque_weight,
+                    )
+                )
+                loss += transmissivity_loss
+                loss_dict['transmissivity'] = transmissivity_loss.item()
 
-            loss += consistency_loss
-            loss_dict['consistency'] = consistency_loss.item()
+            # Retain the original sum-scaled consistency behavior, but use a
+            # continuous glossy gate and handle empty regions safely.
+            if opt.consistency_loss_weight > 0:
+                weight_sum = glossy_weight.sum().clamp_min(1e-10)
+                tran_mean = (transmissivity * glossy_weight).sum() / weight_sum
+                tran_variance = (
+                    (transmissivity - tran_mean).square() * glossy_weight
+                ).sum()
+
+                scatter_mean = (
+                    render_scat * glossy_weight
+                ).sum(dim=(-2, -1), keepdim=True) / weight_sum
+                scatter_variance = (
+                    (render_scat - scatter_mean).square() * glossy_weight
+                ).sum(dim=(-2, -1)).mean()
+                consistency_loss = opt.consistency_loss_weight * (
+                    tran_variance + scatter_variance
+                )
+                loss += consistency_loss
+                loss_dict['consistency'] = consistency_loss.item()
 
         # === 边缘感知 loss：对齐渲染图与 GT 的「边缘×深度」分布 ===
         if opt.lambda_edge_aware > 0 and iteration >= opt.edge_aware_from_iter:
@@ -660,7 +759,9 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                     render_pkg = renderFunc(viewpoint, scene.gaussians)
                     image = torch.clamp(render_pkg['final_rendering'], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to('cuda'), 0.0, 1.0)
-                    gt_transparent_mask = viewpoint.gt_transparent_mask.cuda()
+                    gt_transparent_mask = viewpoint.gt_transparent_mask
+                    if gt_transparent_mask is not None:
+                        gt_transparent_mask = gt_transparent_mask.cuda()
                     if tb_writer and (idx < 5):
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/render', image, global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/final_specular', render_pkg['final_spec'].clip(0, 1), global_step=iteration)
@@ -673,6 +774,18 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/transmissivity', render_pkg['transmissivity'], global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/roughness', render_pkg['roughness'], global_step=iteration)
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/glossy_score', render_pkg['glossy_score'], global_step=iteration)
+                        if opt.decomposition_region_source.lower() == 'glossy':
+                            decomposition_gate = smoothstep_gate(
+                                render_pkg['glossy_score'].detach(),
+                                float(opt.decomposition_glossy_low),
+                                float(opt.decomposition_glossy_high),
+                            )
+                            tb_executor.submit(
+                                tb_writer.add_image,
+                                config['name'] + f'_view_{viewpoint.image_name}/decomposition_gate',
+                                decomposition_gate,
+                                global_step=iteration,
+                            )
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/attenuation', render_pkg['attenuation'], global_step=iteration)
 
                         tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_alpha', render_pkg['surface_alpha'], global_step=iteration)
@@ -699,8 +812,14 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                     psnr_value = psnr(image, gt_image).mean().double()
                     ssim_value = ssim(image, gt_image).mean().double()
                     lpips_value = lpips(image, gt_image).mean().double()
-                    has_window = bool(gt_transparent_mask.any())
-                    has_opaque = bool((~gt_transparent_mask).any())
+                    has_window = bool(
+                        gt_transparent_mask is not None and
+                        gt_transparent_mask.any()
+                    )
+                    has_opaque = bool(
+                        gt_transparent_mask is not None and
+                        (~gt_transparent_mask).any()
+                    )
                     window_psnr_value = masked_psnr(image, gt_image, gt_transparent_mask).mean().double() if has_window else 0.0
                     opaque_psnr_value = masked_psnr(image, gt_image, ~gt_transparent_mask).mean().double() if has_opaque else 0.0
                     if tb_writer:
@@ -708,8 +827,10 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                         tb_writer.add_scalar(f'per_view_{config["name"]}/psnr - {viewpoint.image_name}', psnr_value, iteration)
                         tb_writer.add_scalar(f'per_view_{config["name"]}/ssim - {viewpoint.image_name}', ssim_value, iteration)
                         tb_writer.add_scalar(f'per_view_{config["name"]}/lpips - {viewpoint.image_name}', lpips_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/window_psnr - {viewpoint.image_name}', window_psnr_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/opaque_psnr - {viewpoint.image_name}', opaque_psnr_value, iteration)
+                        if has_window:
+                            tb_writer.add_scalar(f'per_view_{config["name"]}/window_psnr - {viewpoint.image_name}', window_psnr_value, iteration)
+                        if has_opaque:
+                            tb_writer.add_scalar(f'per_view_{config["name"]}/opaque_psnr - {viewpoint.image_name}', opaque_psnr_value, iteration)
                     l1_test += l1_value
                     psnr_test += psnr_value
                     ssim_test += ssim_value
@@ -725,14 +846,21 @@ def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, ela
                 lpips_test /= len(config['cameras'])
                 window_psnr_test /= max(window_psnr_views, 1)
                 opaque_psnr_test /= max(opaque_psnr_views, 1)
-                print(f'\n[ITER {iteration}] Evaluating {config["name"]}: PSNR {psnr_test}, SSIM {ssim_test}, LPIPS {lpips_test}, Window PSNR {window_psnr_test}, Opaque PSNR {opaque_psnr_test}')
+                region_metrics = ''
+                if window_psnr_views:
+                    region_metrics += f', Window PSNR {window_psnr_test}'
+                if opaque_psnr_views:
+                    region_metrics += f', Opaque PSNR {opaque_psnr_test}'
+                print(f'\n[ITER {iteration}] Evaluating {config["name"]}: PSNR {psnr_test}, SSIM {ssim_test}, LPIPS {lpips_test}{region_metrics}')
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - window_psnr', window_psnr_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - opaque_psnr', opaque_psnr_test, iteration)
+                    if window_psnr_views:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - window_psnr', window_psnr_test, iteration)
+                    if opaque_psnr_views:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - opaque_psnr', opaque_psnr_test, iteration)
 
         torch.cuda.empty_cache()
 

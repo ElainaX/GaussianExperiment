@@ -18,6 +18,7 @@ import torch
 from tqdm import tqdm
 
 from utils.image_utils import apply_colormap, log_normalize
+from utils.loss_utils import smoothstep_gate
 from utils.render_utils import save_img_u8
 
 
@@ -105,12 +106,20 @@ class GaussianExtractor(object):
         if export_path is not None:
             render_path = os.path.join(export_path, 'renders')
             gts_path = os.path.join(export_path, 'gt')
-            masks_path = os.path.join(export_path, 'transparent_masks')
+            has_transparent_masks = any(
+                camera.has_transparent_mask for camera in viewpoint_stack
+            )
+            masks_path = (
+                os.path.join(export_path, 'transparent_masks')
+                if has_transparent_masks
+                else None
+            )
             vis_path = os.path.join(export_path, 'vis')
             os.makedirs(render_path, exist_ok=True)
             os.makedirs(vis_path, exist_ok=True)
             os.makedirs(gts_path, exist_ok=True)
-            os.makedirs(masks_path, exist_ok=True)
+            if masks_path is not None:
+                os.makedirs(masks_path, exist_ok=True)
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc='reconstruct radiance fields'):
@@ -202,11 +211,12 @@ class GaussianExtractor(object):
                             return_details=True,
                         )
                     gt = viewpoint_cam.original_image
-                    mask = viewpoint_cam.gt_transparent_mask.squeeze(0).float()
                     if gt.shape[0] == 4:
                         gt = gt[:3, ...] * gt[3:, ...] + (1 - gt[3:, ...]) * self.background[:, None, None]
                     executor.submit(save_img_u8, gt.permute(1, 2, 0).cpu().numpy(), os.path.join(gts_path, '{0:05d}'.format(i) + '.png'))
-                    executor.submit(save_img_u8, mask.cpu().numpy(), os.path.join(masks_path, '{0:05d}'.format(i) + '.png'))
+                    if viewpoint_cam.has_transparent_mask:
+                        mask = viewpoint_cam.gt_transparent_mask.squeeze(0).float()
+                        executor.submit(save_img_u8, mask.cpu().numpy(), os.path.join(masks_path, '{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, rgb.permute(1, 2, 0).cpu().numpy(), os.path.join(render_path, '{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_scat'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'diffuse_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['render_spec'].clip(0, 1).permute(1, 2, 0).cpu().numpy(), os.path.join(vis_path, 'specular_{0:05d}'.format(i) + '.png'))
@@ -250,6 +260,23 @@ class GaussianExtractor(object):
                     executor.submit(save_img_u8, render_pkg['reflectance'][0].cpu().numpy(), os.path.join(vis_path, 'reflectance_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['roughness'][0].cpu().numpy(), os.path.join(vis_path, 'roughness_{0:05d}'.format(i) + '.png'))
                     executor.submit(save_img_u8, render_pkg['glossy_score'][0].cpu().numpy(), os.path.join(vis_path, 'glossy_score_{0:05d}'.format(i) + '.png'))
+                    if (
+                        getattr(
+                            self.prior_options,
+                            'decomposition_region_source',
+                            'none',
+                        ).lower() == 'glossy'
+                    ):
+                        decomposition_gate = smoothstep_gate(
+                            render_pkg['glossy_score'].detach(),
+                            float(getattr(self.prior_options, 'decomposition_glossy_low', 0.15)),
+                            float(getattr(self.prior_options, 'decomposition_glossy_high', 0.30)),
+                        )
+                        executor.submit(
+                            save_img_u8,
+                            decomposition_gate[0].cpu().numpy(),
+                            os.path.join(vis_path, f'decomposition_gate_{i:05d}.png'),
+                        )
                     glossy_threshold = float(getattr(self.prior_options, 'glossy_threshold', 0.15))
                     executor.submit(
                         save_img_u8,

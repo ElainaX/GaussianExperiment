@@ -169,7 +169,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, prior_path=
         image = Image.open(image_path)
         prior_paths = find_image_priors(prior_path, image_path)
         transparent_mask_path = os.path.join(scene_root, 'transparent_masks', os.path.splitext(os.path.basename(extr.name))[0] + '.png')
-        transparent_mask = Image.open(transparent_mask_path)
+        transparent_mask = Image.open(transparent_mask_path) if os.path.isfile(transparent_mask_path) else None
 
         cam_info = CameraInfo(
             uid=uid,
@@ -191,6 +191,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, prior_path=
 
     sys.stdout.write('\n')
     _print_prior_summary(cam_infos, prior_path)
+    mask_count = sum(cam.transparent_mask is not None for cam in cam_infos)
+    if mask_count:
+        print(f'Loaded optional transparent masks: {mask_count}/{len(cam_infos)}')
+    else:
+        print('No transparent masks found; training can use glossy-score decomposition regions.')
     return cam_infos
 
 
